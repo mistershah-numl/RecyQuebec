@@ -8,7 +8,7 @@ export const FREE_MAIL =
   /^(gmail|googlemail|hotmail|outlook|live|msn|yahoo|ymail|aol|icloud|me|mac|videotron|sympatico|bell|globetrotter|cgocable|cogeco|telus|shaw|rogers|videotron\.qc|qc\.aira|proton|protonmail|gmx|mail|zoho|yandex|laposte|orange|free|sfr|wanadoo)\.[a-z.]+$/i;
 
 export const BLOCKED_SITES =
-  /(^|\.)(lightinthebox|miniinthebox|aliexpress|alibaba|temu|shein|wish|dhgate|ebay|etsy|walmart|bestbuy|costco|homedepot|rona|canadiantire|amazon|wayfair|overstock|target|newegg|zuoyebang|baidu|qq|163|weibo|taobao|tmall|jd|rakuten|kijiji|craigslist|marketplace|shopify|myshopify|wix|wixsite|wixpress|squarespace|weebly|godaddy|wordpress|blogspot|medium|pinterest|reddit|quora|wikipedia|youtube|facebook|instagram|linkedin|twitter|x|tiktok|google|bing|yahoo|duckduckgo|yelp|pagesjaunes|yellowpages|canada411|411|indeed|glassdoor|zoominfo|opencorporates|b2bhint|can1business|opengovca|dnb|bbb|cylex|tripadvisor|sentry|cloudflare|lapresse|ledevoir|journaldemontreal|radio-canada|cbc|ctvnews|globalnews|uqam|umontreal|ulaval|usherbrooke|mcgill|concordia)\.[a-z.]+$|(^|\.)(quebec\.ca|gouv\.qc\.ca|gc\.ca|canada\.ca)$|\.(gov|gouv\.fr|edu|cn|ru)$|\.gov\.[a-z.]+$|\.(sc|ny|ca|tx)\.us$/i;
+  /(^|\.)(lightinthebox|miniinthebox|aliexpress|alibaba|temu|shein|wish|dhgate|ebay|etsy|walmart|bestbuy|costco|homedepot|rona|canadiantire|amazon|wayfair|overstock|target|newegg|zuoyebang|baidu|qq|163|weibo|taobao|tmall|jd|rakuten|kijiji|craigslist|marketplace|shopify|myshopify|wix|wixsite|wixpress|squarespace|weebly|godaddy|wordpress|blogspot|medium|pinterest|reddit|quora|wikipedia|youtube|facebook|instagram|linkedin|twitter|x|tiktok|google|bing|yahoo|duckduckgo|yelp|pagesjaunes|yellowpages|canada411|411|indeed|glassdoor|zoominfo|opencorporates|b2bhint|can1business|opengovca|dnb|bbb|cylex|tripadvisor|sentry|cloudflare|lapresse|ledevoir|journaldemontreal|radio-canada|cbc|ctvnews|globalnews)\.[a-z.]+$|(^|\.)(quebec\.ca|gouv\.qc\.ca|gc\.ca|canada\.ca)$|\.(gov|gouv\.fr|cn|ru)$|\.gov\.[a-z.]+$|\.(sc|ny|tx)\.us$/i;
 
 const STOP = new Set([
   "inc", "ltee", "ltd", "limitee", "limitée", "enr", "senc", "s.e.n.c", "corp", "corporation", "compagnie", "cie",
@@ -16,19 +16,62 @@ const STOP = new Set([
   "group", "services", "service", "entreprises", "entreprise", "construction", "co",
 ]);
 
+/** Known Quebec & Canadian higher-ed, colleges, CEGEPs, universities and school service centers */
+const QUEBEC_EDU_DOMAINS = new Set([
+  "mcgill.ca", "concordia.ca", "umontreal.ca", "uqam.ca", "ulaval.ca", "usherbrooke.ca",
+  "hec.ca", "polymtl.ca", "etsmtl.ca", "uqtr.ca", "uqac.ca", "uqar.ca", "uqo.ca", "inrs.ca", "enap.ca", "teluq.ca", "ubishops.ca",
+  "dawsoncollege.qc.ca", "vaniercollege.qc.ca", "johnabbott.qc.ca", "marianopolis.edu",
+  "collegeahuntsic.qc.ca", "cmaisonneuve.qc.ca", "clg.qc.ca", "cvm.qc.ca", "cegepsherbrooke.qc.ca",
+  "cegep-ste-foy.qc.ca", "collegebdeb.qc.ca", "cegepgim.ca", "cegepoutaouais.qc.ca",
+  "csdm.qc.ca", "cssdm.gouv.qc.ca", "cssmi.gouv.qc.ca", "csmb.qc.ca", "cssmb.gouv.qc.ca",
+]);
+
+/** True when the domain is an educational institution (.edu, college, cegep, university, etc.). */
+export function isEducationalDomain(d: string | null | undefined): boolean {
+  if (!d) return false;
+  const lower = d.toLowerCase().trim();
+  if (lower.endsWith(".edu") || lower.includes(".edu.") || lower.endsWith(".edu.ca")) return true;
+  if (QUEBEC_EDU_DOMAINS.has(lower)) return true;
+  if (
+    /(^|\.)(cegep|college|ecole|school|univ|universite|university|academie|academy|css|csdm|polytechnique)[a-z0-9-]*\.(ca|qc\.ca|edu|org)$/i.test(
+      lower,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** True when the organization name indicates an educational institution. */
+export function isEducationalInstitution(name: string | null | undefined): boolean {
+  if (!name) return false;
+  const n = name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  return /\b(universite|university|college|cegep|ecole|school|academie|academy|institut|institute|polytechnique|scolaire|formation|education|campus|faculte)\b/i.test(
+    n,
+  );
+}
+
 /** Extracts a clean host, fixing glued text such as "gmail.comthis". */
 export function cleanDomain(raw: string | null | undefined): string | null {
   if (!raw) return null;
   let s = String(raw).trim().toLowerCase();
   s = s.replace(/^[a-z]+:\/\//, "").replace(/^www\./, "").split(/[/?#\s,;]/)[0] ?? "";
   if (s.includes("@")) s = s.split("@")[1] ?? "";
-  const m = s.match(/^([a-z0-9-]+(?:\.[a-z0-9-]+)*?\.(?:qc\.ca|ca|com|net|org|info|biz|io|co|fr|us|gov|edu|quebec))(?:[a-z]+)?$/);
+  const m = s.match(
+    /^([a-z0-9-]+(?:\.[a-z0-9-]+)*?\.(?:edu\.ca|qc\.ca|ca|com|net|org|edu|info|biz|io|co|fr|us|gov|quebec))(?:[a-z]+)?$/,
+  );
   const host = m?.[1] ?? null;
   return host && /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host) ? host : null;
 }
 
 export const isFreeMailDomain = (d: string | null | undefined) => Boolean(d && FREE_MAIL.test(d.toLowerCase().trim()));
-export const isBlockedSite = (d: string | null | undefined) => Boolean(d && BLOCKED_SITES.test(d.toLowerCase().trim()));
+export const isBlockedSite = (d: string | null | undefined) => {
+  if (!d) return false;
+  const lower = d.toLowerCase().trim();
+  // Educational domains (.edu, universities, colleges, schools) are NEVER blocked
+  if (isEducationalDomain(lower)) return false;
+  return BLOCKED_SITES.test(lower);
+};
 
 export function nameTokens(name: string): string[] {
   return name
@@ -103,7 +146,8 @@ export function guardRow(r: GuardInput): GuardResult {
     notes.push(`${domain} is an email provider, not a company website — cleared`);
     domain = null;
   }
-  if (domain && isBlockedSite(domain)) {
+  const isEdu = isEducationalDomain(domain) || isEducationalInstitution(r.company_name);
+  if (domain && !isEdu && isBlockedSite(domain)) {
     notes.push(`${domain} is a marketplace/directory/government/foreign site — cleared`);
     domain = null;
   }
@@ -116,7 +160,8 @@ export function guardRow(r: GuardInput): GuardResult {
       email = null;
     } else {
       email = `${at[0]}@${ed}`;
-      if (!isFreeMailDomain(ed) && isBlockedSite(ed)) {
+      const emailIsEdu = isEducationalDomain(ed) || isEducationalInstitution(r.company_name);
+      if (!isFreeMailDomain(ed) && !emailIsEdu && isBlockedSite(ed)) {
         notes.push(`email ${email} belongs to an unrelated platform — cleared`);
         email = null;
       }

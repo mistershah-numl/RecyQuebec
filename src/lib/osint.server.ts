@@ -123,7 +123,7 @@ const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const PHONE_RE = /(?:\+?1[\s.-]?)?\(?([2-9]\d{2})\)?[\s.-]?(\d{3})[\s.-]?(\d{4})/g;
 
 const TITLE_WORDS =
-  "(?:pr[ée]sident(?:e)?(?:[- ]directeur[- ]g[ée]n[ée]ral)?|vice[- ]pr[ée]sident(?:e)?|directeur(?:trice)?(?:\\s+g[ée]n[ée]ral(?:e)?)?|propri[ée]taire|fondateur|fondatrice|associ[ée]|g[ée]rant(?:e)?|chief executive officer|ceo|cfo|coo|president|owner|founder|general manager|managing director|partner)";
+  "(?:pr[ée]sident(?:e)?(?:[- ]directeur[- ]g[ée]n[ée]ral)?|vice[- ]pr[ée]sident(?:e)?|directeur(?:trice)?(?:\\s+g[ée]n[ée]ral(?:e)?|\\s+d'[ée]tudes|\\s+des\\s+[ée]tudes)?|propri[ée]taire|fondateur|fondatrice|associ[ée]|g[ée]rant(?:e)?|administrateur(?:trice)?|recteur|rectrice|doyen(?:ne)?|principal(?:e)?|provost|chancellor|coordonnateur(?:trice)?|secr[ée]taire(?:\\s+g[ée]n[ée]ral(?:e)?)?|tr[ée]sorier(?:i[èe]re)?|dg|chief executive officer|ceo|cfo|coo|cto|cmo|cro|president|owner|founder|general manager|managing director|partner|executive director)";
 
 export type OsintOptions = {
   /** Search engines + snippet mining (always on). */
@@ -756,7 +756,9 @@ export function emailPatterns(personName: string, domain: string): string[] {
   return [
     `${first}.${last}@${domain}`,
     `${first[0]}${last}@${domain}`,
+    `${first[0]}.${last}@${domain}`,
     `${first}@${domain}`,
+    `${last}.${first}@${domain}`,
     `${first}${last}@${domain}`,
   ];
 }

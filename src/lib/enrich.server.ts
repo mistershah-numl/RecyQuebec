@@ -21,6 +21,8 @@ import {
   sharedDomainAllowed,
   isBlockedSite,
   isFreeMailDomain,
+  isEducationalDomain,
+  isEducationalInstitution,
   emailMatchesCompany,
   cleanDomain,
 } from "./domain-guard";
@@ -331,7 +333,7 @@ const VENDOR_DOMAINS =
 export function isVendorDomain(domain: string | null | undefined): boolean {
   if (!domain) return false;
   const d = domain.toLowerCase().trim();
-  if (isFreeMailDomain(d)) return false;
+  if (isFreeMailDomain(d) || isEducationalDomain(d)) return false;
   return isBlockedSite(d) || VENDOR_DOMAINS.test(d);
 }
 
@@ -419,8 +421,10 @@ export async function assessEmail(email: string, ctx: AssessContext, signal?: Ab
   if (hasDmarc) reasons.push("Domain publishes a DMARC policy");
 
   const freemail = isFreeMailDomain(domain) || FREEMAIL.has(domain);
+  const isEdu = isEducationalDomain(domain) || Boolean(ctx.companyName && isEducationalInstitution(ctx.companyName));
   const role = ROLE_LOCAL.test(local.replace(/[._-].*$/, "")) || ROLE_LOCAL.test(local);
   signals["freemail"] = freemail;
+  signals["educational"] = isEdu;
   signals["role_account"] = role;
 
   const onCompanyDomain = Boolean(
@@ -429,6 +433,7 @@ export async function assessEmail(email: string, ctx: AssessContext, signal?: Ab
   );
   signals["on_company_domain"] = onCompanyDomain;
   if (onCompanyDomain) reasons.push("Address is on the company's own web domain");
+  if (isEdu) reasons.push("Institutional / educational domain (.edu, university, college, school)");
 
   // Company match: does the local part directly identify the company name?
   // Vital for Quebec & Canadian SMBs that use Gmail/Hotmail/Videotron (e.g. gourmandelice30@gmail.com).
@@ -457,11 +462,11 @@ export async function assessEmail(email: string, ctx: AssessContext, signal?: Ab
     nameMatch = nameMatch || initialsMatch;
   }
   signals["name_match"] = nameMatch;
-  if (nameMatch) reasons.push(`Local part matches ${ctx.personName}`);
+  if (nameMatch) reasons.push(`Local part matches executive (${ctx.personName})`);
 
   const email_type: EmailAssessment["email_type"] = nameMatch || ctx.origin === "pattern"
     ? "executive"
-    : companyMatch || role || onCompanyDomain
+    : companyMatch || role || onCompanyDomain || isEdu
       ? "company"
       : freemail
         ? "personal"
@@ -472,19 +477,20 @@ export async function assessEmail(email: string, ctx: AssessContext, signal?: Ab
   if (spf || hasDmarc) score += 0.5;
   if (onCompanyDomain) score += 1.5;
   if (companyMatch) score += 1.5; // Direct company brand match
+  if (nameMatch) score += 1.5; // Direct executive name match
+  if (isEdu && onCompanyDomain) score += 1;
   if (mentions >= 1) score += 1;
   if (mentions >= 2) score += 0.5;
-  if (nameMatch) score += 1;
   if (ctx.origin === "pattern" && mentions === 0) score -= 1; // guessed, never seen published
   if (ctx.origin === "ai" && mentions === 0) score -= 1.5; // model output with no public trace
   if (freemail && !nameMatch && !companyMatch && mentions === 0) score -= 1;
   const confidence = Math.max(0, Math.min(5, Math.round(score)));
 
   let status: EmailAssessment["status"];
-  if (mentions >= 1 && (onCompanyDomain || companyMatch || nameMatch || mentions >= 2)) {
+  if (mentions >= 1 && (onCompanyDomain || companyMatch || nameMatch || isEdu || mentions >= 2)) {
     status = "Verified";
     reasons.push("Cross-checked: deliverable and publicly attributed to this company/person");
-  } else if (mentions >= 1 || onCompanyDomain || companyMatch) {
+  } else if (mentions >= 1 || onCompanyDomain || companyMatch || isEdu) {
     status = "MX Verified";
     reasons.push("Deliverable and seen publicly, but not attributed to a named person");
   } else {
@@ -672,15 +678,17 @@ function looksPersonal(email: string, people: { name: string }[]): boolean {
 
 /**
  * Higher tier = closer to a confirmed executive or verified company mailbox.
- * Tier hierarchy:
+ * Executive-first hierarchy:
  *  6: Named executive on confirmed company domain (e.g. j.tremblay@company.com)
- *  5: Speculative pattern on company domain OR named executive on public provider
+ *  5.5: Speculative executive pattern on company domain (first.last@domain)
+ *  5: Named executive on public/ISP provider (e.g. j.tremblay@gmail.com)
  *  4.5: Company-matched mailbox on company's own domain
  *  4: Branded company mailbox on public/ISP provider (e.g. gourmandelice30@gmail.com)
  *  3.5: Role / department mailbox on company's own domain (info@, contact@)
+ *  3: Institutional / educational mailbox (.edu, universities, CEGEPs, schools)
  *  2: Public web-scraped address or general mailbox
  *  1: Fallback address
- * -1: Drop / blocked platform address (LightInTheBox, AliExpress, Amazon, etc.)
+ * -1: Drop / blocked platform address (LightInTheBox, AliExpress, Temu, Amazon, etc.)
  */
 function candidateTier(
   email: string,
@@ -693,31 +701,39 @@ function candidateTier(
   const local = at[0]?.toLowerCase() ?? "";
   const mailDomain = at[1]?.toLowerCase() ?? "";
 
-  // Drop blocked / vendor platforms
-  if (!isFreeMailDomain(mailDomain) && isBlockedSite(mailDomain)) {
+  // Drop blocked / vendor platforms (never drop educational or ISP domains)
+  if (!isFreeMailDomain(mailDomain) && !isEducationalDomain(mailDomain) && isBlockedSite(mailDomain)) {
     return -1;
   }
 
   const onOwn = !!domain && (mailDomain === domain.toLowerCase() || mailDomain.endsWith(`.${domain.toLowerCase()}`));
   const isPersonal = looksPersonal(email, people);
   const matchesCompany = Boolean(companyName && emailMatchesCompany(email, companyName));
+  const isEdu = isEducationalDomain(mailDomain) || Boolean(companyName && isEducationalInstitution(companyName));
 
   // 1. Executive personal mailbox on own domain
   if (isPersonal && onOwn) return 6;
 
-  // 2. Pattern candidate on own domain or personal mailbox on free-mail
-  if (origin === "pattern" && onOwn) return 5;
+  // 2. Pattern candidate on own domain (e.g. first.last@domain)
+  if (origin === "pattern" && onOwn) return 5.5;
+
+  // 3. Named executive personal mailbox on public mail / Gmail
   if (isPersonal) return 5;
 
-  // 3. Directly company-matched mailbox (e.g. gourmandelice30@gmail.com)
+  // 4. Directly company-matched mailbox on own domain
   if (matchesCompany && onOwn) return 4.5;
+
+  // 5. Directly company-matched mailbox on public mail / Gmail (e.g. gourmandelice30@gmail.com)
   if (matchesCompany) return 4;
 
-  // 4. Role / generic mailbox on company's own domain (info@domain.com, contact@domain.com)
+  // 6. Role / generic mailbox on company's own domain (info@domain.com, contact@domain.com)
   if (onOwn) return 3.5;
   if (origin === "generic") return 3.5;
 
-  // 5. Normal web-scraped email or own-domain unknown mailbox
+  // 7. Institutional / educational mailbox
+  if (isEdu) return 3;
+
+  // 8. Normal web-scraped email or own-domain unknown mailbox
   if (origin === "web" || origin === "own-domain") return 2;
 
   return 1;
@@ -1037,9 +1053,12 @@ export async function enrichCompany(
       "success",
     );
 
+    const chosenPerson =
+      evidence.people.find((p) => looksPersonal(best!.cand.email, [p])) ?? person;
+
     return {
-      executive_name: person?.name ?? null,
-      title: person?.title ?? null,
+      executive_name: chosenPerson?.name ?? null,
+      title: chosenPerson?.title ?? null,
       email: best!.cand.email,
       phone,
       domain: targets.domain === false ? null : (evidence.domain ?? best!.cand.email.split("@")[1]!),
