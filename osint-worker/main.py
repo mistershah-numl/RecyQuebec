@@ -91,6 +91,8 @@ BAD_EMAIL_HINTS = (
     "example.com", "sentry.io", "wixpress.com", "godaddy.com", "schema.org",
     "domain.com", "email.com", ".png", ".jpg", ".jpeg", ".svg", ".webp", "@2x",
     "cloudflare.com", "protection", "privacy", "whoisguard",
+    "lightinthebox.com", "miniinthebox.com", "aliexpress.com", "alibaba.com",
+    "temu.com", "shein.com", "wish.com", "dhgate.com", "myshopify.com", "shopify.com",
 )
 BAD_HOSTS = ("duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com")
 
@@ -688,6 +690,8 @@ async def _osint_impl(body: OsintIn):
     address: Optional[str] = None
     domain = body.domain
     browser_budget = MAX_OSINT_BROWSER_FALLBACKS
+    # Track raw execution data for frontend "pre-record activity" display
+    raw_execution_sources: List[Dict[str, Any]] = []
 
     async def osint_fetch(url: str, wait_ms: int = 900) -> Dict[str, str]:
         nonlocal browser_budget
@@ -696,6 +700,17 @@ async def _osint_impl(body: OsintIn):
             return direct
         browser_budget -= 1
         return await fetch_text(url, wait_ms=wait_ms, allow_browser=True)
+
+    def add_raw_source(url: str, html: str, extraction_points: List[str], selector: str = ""):
+        """Log raw HTML/JS source info for data extraction provenance."""
+        source_info = {
+            "url": url,
+            "selector": selector or "general",
+            "extraction_points": extraction_points[:5],  # Limit to top 5 points
+            "html_preview": html[:2000] if html else "",
+        }
+        raw_execution_sources.append(source_info)
+        log.append(f"[RAW] Source: {url} - Extraction points: {', '.join(extraction_points[:3])}")
 
     clean_name = LEGAL_SUFFIX_RE.sub("", company_name).strip()
     city_str = body.city or ""
@@ -711,10 +726,17 @@ async def _osint_impl(body: OsintIn):
         for u in urls[:5]:
             host = urlparse(u).netloc.lower().replace("www.", "")
             candidate_page = await osint_fetch(u, wait_ms=500)
-            candidate_text = clean_html_to_markdown(candidate_page["html"])
+            candidate_html = candidate_page["html"]
+            candidate_text = clean_html_to_markdown(candidate_html)
             if host and "." in host and trusted_company_page(candidate_text, u, company_name, body.neq, None):
                 domain = host
                 log.append(f"Validated Canadian domain: {domain}")
+                # Log raw HTML source for domain page
+                add_raw_source(
+                    u, candidate_html,
+                    ["domain_verification", "company_mention"],
+                    "domain discovery page"
+                )
                 break
 
     # 2. SpiderFoot & theHarvester Recon Pass
@@ -727,6 +749,12 @@ async def _osint_impl(body: OsintIn):
         if harvester_emails:
             emails += harvester_emails
             log.append(f"theHarvester: Found {len(harvester_emails)} passive email targets")
+            # Log harvest source
+            add_raw_source(
+                f"crt.sh domain search: {domain}",
+                str(harvester_emails[:500]),
+                ["crt_sh_certificate_emails", "duckduckgo_dork_emails"],
+            )
         if subdomains:
             log.append(f"theHarvester: Mapped subdomains -> {', '.join(subdomains[:4])}")
 
@@ -736,6 +764,15 @@ async def _osint_impl(body: OsintIn):
         pages = [base]
         home = await osint_fetch(base)
         soup = BeautifulSoup(home["html"], "html.parser")
+
+        # Log home page HTML for data extraction provenance
+        home_html = home["html"]
+        add_raw_source(
+            base, home_html,
+            ["homepage_venue_links", "contact_page_links", "href_attributes"],
+            "site discovery"
+        )
+
         for a in soup.select("a[href]"):
             t = (a.get_text() or "").lower() + " " + a["href"].lower()
             if any(k in t for k in ("contact", "about", "propos", "equipe", "team", "direction", "nous", "joindre")):
@@ -747,12 +784,30 @@ async def _osint_impl(body: OsintIn):
                 continue
             seen.add(p)
             r = await osint_fetch(p)
-            
+            page_html = r["html"]
+
             # Clean page into structured Markdown
-            markdown_content = clean_html_to_markdown(r["html"])
-            
-            emails += EMAIL_RE.findall(r["html"])
-            phones += [norm_phone(m) for m in PHONE_RE.finditer(markdown_content)]
+            markdown_content = clean_html_to_markdown(page_html)
+
+            # Log raw extraction source with HTML preview
+            extraction_summary = []
+            emails_found = EMAIL_RE.findall(page_html)
+            if emails_found:
+                extraction_summary.append("email_regex")
+            phones_found = [norm_phone(m) for m in PHONE_RE.finditer(markdown_content)]
+            if phones_found:
+                extraction_summary.append("phone_regex")
+            # Check for executive names in markdown
+            exec_lines = []
+            for line in markdown_content.splitlines():
+                line_clean = line.strip()
+                if EXEC_TITLE_RE.search(line_clean) and 10 < len(line_clean) < 90:
+                    exec_lines.append(line_clean)
+            if exec_lines:
+                extraction_summary.append("exec_title_pattern")
+
+            emails += emails_found
+            phones += phones_found
 
             # Extract named executives near hierarchy titles
             for line in markdown_content.splitlines():
@@ -761,7 +816,7 @@ async def _osint_impl(body: OsintIn):
                     people.append({"name": line_clean, "title": ""})
 
             # Extract Social Handles
-            page_soup = BeautifulSoup(r["html"], "html.parser")
+            page_soup = BeautifulSoup(page_html, "html.parser")
             for a in page_soup.select("a[href]"):
                 h = a["href"]
                 for net in ("linkedin.com", "facebook.com", "instagram.com", "x.com"):
@@ -775,6 +830,13 @@ async def _osint_impl(body: OsintIn):
                 )
                 if m:
                     address = m.group(0)
+
+            # Log the raw HTML/JS source
+            add_raw_source(
+                p, page_html,
+                extraction_summary if extraction_summary else ["general_html_parse"],
+                "site crawl"
+            )
             log.append(f"Crawled {p} (Found {len(emails)} emails so far)")
 
     # 4. Executive Pattern Candidate Permutations
@@ -800,7 +862,16 @@ async def _osint_impl(body: OsintIn):
             )
             for candidate_url in found[:3]:
                 candidate = await osint_fetch(candidate_url, wait_ms=500)
-                candidate_text = clean_html_to_markdown(candidate["html"])
+                candidate_html = candidate["html"]
+                candidate_text = clean_html_to_markdown(candidate_html)
+
+                # Log social profile extraction source
+                add_raw_source(
+                    candidate_url, candidate_html,
+                    ["meta_description", "profile_summary", "href_links", "title_tag"],
+                    f"social:{key}"
+                )
+
                 if trusted_company_page(candidate_text, candidate_url, company_name, body.neq, domain):
                     socials[key] = candidate_url
                     log.append(f"Validated Canadian {key}: {candidate_url}")
@@ -816,7 +887,18 @@ async def _osint_impl(body: OsintIn):
             hits = await search(f"https://duckduckgo.com/html/?q={quote_plus(f'site:{extra} {clean_name}')}")
             for u in hits[:2]:
                 r = await osint_fetch(u, wait_ms=1000)
-                txt = clean_html_to_markdown(r["html"])
+                html_content = r["html"]
+                txt = clean_html_to_markdown(html_content)
+
+                # Log custom site extraction
+                emails_in_page = EMAIL_RE.findall(txt)
+                phones_in_page = [norm_phone(m) for m in PHONE_RE.finditer(txt)]
+                add_raw_source(
+                    u, html_content,
+                    ["custom_site_emails", "custom_site_phones", "contact_forms"],
+                    f"extra_site:{extra}"
+                )
+
                 if not trusted_company_page(txt, u, company_name, body.neq, domain):
                     log.append(f"Extra site rejected (company mismatch): {u}")
                     continue
@@ -880,6 +962,14 @@ async def _osint_impl(body: OsintIn):
         if cross.get(e, {}).get("matched") or (domain and e.endswith("@" + domain))
     ]
 
+    # Add raw execution sources to log for frontend "pre-record activity"
+    if raw_execution_sources:
+        for src in raw_execution_sources[:15]:
+            url = src.get("url", "")
+            source_type = src.get("selector", "general")
+            points = "; ".join(src.get("extraction_points", []))
+            log.append(f"[RAW EXECUTION] {url} | Source: {source_type} | Points: {points}")
+
     return {
         "ok": True,
         "domain": domain,
@@ -893,8 +983,9 @@ async def _osint_impl(body: OsintIn):
         "linkedin": socials.get("linkedin.com"),
         "facebook": socials.get("facebook.com"),
         "cross_check": cross,
-        "trail": log[-20:],
+        "trail": log[-30:],
         "log": log,
+        "raw_execution_sources": raw_execution_sources[:20],  # New field for detailed provenance
     }
 
 

@@ -819,6 +819,19 @@ export async function enrichCompany(
   if (evidence.registryUrl) await onStep(`Registry record: ${evidence.registryUrl}`);
   if (evidence.address) await onStep(`Address: ${evidence.address}`);
 
+  // Log raw execution sources for detailed provenance
+  if (evidence.rawExecutionSources && evidence.rawExecutionSources.length > 0) {
+    for (const src of evidence.rawExecutionSources.slice(0, 10)) {
+      if (src && typeof src === "object") {
+        const url = (src as any).url ?? "unknown";
+        const type = (src as any).selector ?? "general";
+        const points = ((src as any).extraction_points ?? []).join(", ") || "general";
+        const htmlPreview = (src as any).html_preview ? ` (HTML: ${(src as any).html_preview.slice(0, 300)})` : "";
+        await onStep(`[RAW SOURCE] ${url} | Type: ${type} | Points: ${points}${htmlPreview}`);
+      }
+    }
+  }
+
   // Legal status is opt-in and only kept when independent registry sources agree.
   const wantStatus = targets.companyStatus !== false;
   const statusConfirmed = Boolean(evidence.companyStatus) && evidence.statusConfirmations >= 1;

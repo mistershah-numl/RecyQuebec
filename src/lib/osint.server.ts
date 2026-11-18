@@ -181,6 +181,13 @@ export type Evidence = {
   statusVotes: StatusVote[];
   /** Every page URL that was successfully read while building this evidence. */
   sourceUrls: string[];
+  /** Detailed raw execution sources with HTML previews for data extraction provenance. */
+  rawExecutionSources?: Array<{
+    url: string;
+    selector: string;
+    extraction_points: string[];
+    html_preview: string;
+  }>;
 };
 
 export type StatusVote = {
@@ -334,6 +341,12 @@ export type WorkerOsintResult = {
   facebook: string | null;
   texts: string[];
   trail: string[];
+  rawExecutionSources?: Array<{
+    url: string;
+    selector: string;
+    extraction_points: string[];
+    html_preview: string;
+  }>;
 };
 
 /**
@@ -408,6 +421,7 @@ export async function workerOsint(input: {
       facebook: str(d.facebook),
       texts: (d.texts ?? []).filter((t) => typeof t === "string").map((t) => t.slice(0, 12_000)).slice(0, 25),
       trail: (d.trail ?? []).filter((t) => typeof t === "string").slice(0, 25),
+      rawExecutionSources: ((d.rawExecutionSources ?? (d as any).raw_execution_sources ?? []) as any[]).slice(0, 20),
     };
   } catch {
     return null;
@@ -1018,6 +1032,15 @@ export async function gatherEvidence(
       `osint worker: ${tool.emails.length} emails, ${tool.phones.length} phones, ${tool.people.length} people${tool.domain ? `, domain ${tool.domain}` : ""}`,
     );
     for (const t of tool.trail) trail.push(`worker: ${t}`);
+    // Include raw execution sources for detailed provenance
+    if (tool.rawExecutionSources && tool.rawExecutionSources.length > 0) {
+      for (const src of tool.rawExecutionSources.slice(0, 10)) {
+        const url = src.url ?? "unknown";
+        const type = src.selector ?? "general";
+        const points = (src.extraction_points ?? []).join(", ") || "general";
+        trail.push(`[RAW SOURCE] ${url} | Type: ${type} | Points: ${points}`);
+      }
+    }
   }
 
   const where = `${company.city ? ` ${company.city}` : ""} ${region}`;
@@ -1295,6 +1318,7 @@ export async function gatherEvidence(
     statusConfirmations,
     statusVotes,
     sourceUrls: Array.from(new Set([...sourceUrls, ...(socials.linkedin ? [socials.linkedin] : []), ...(socials.facebook ? [socials.facebook] : [])])).slice(0, 30),
+    rawExecutionSources: tool?.rawExecutionSources?.slice(0, 20),
   };
 }
 
