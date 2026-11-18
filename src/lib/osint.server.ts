@@ -360,6 +360,7 @@ export async function workerOsint(input: {
   neq: string | null;
   city: string | null;
   postal_code: string | null;
+  address?: string | null;
   region: string;
   keywords: string;
   sites: string[];
@@ -715,7 +716,7 @@ function collectPeople(text: string): { name: string; title: string }[] {
   ];
   for (const [i, re] of patterns.entries()) {
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) && out.length < 6) {
+    while ((m = re.exec(text)) && out.length < 20) {
       const name = (i === 0 ? m[1] : m[2])
         ?.trim()
         .replace(/\s+(vice|pr[ée]sident(e)?|directeur|directrice|president|ceo|owner|fondateur|associ[ée]|g[ée]rant(e)?|chief)$/i, "")
@@ -730,17 +731,32 @@ function collectPeople(text: string): { name: string; title: string }[] {
 }
 
 const CONTACT_HINT =
-  /(contact|nous-joindre|nous_joindre|joindre|coordonnees|coordonn[ée]es|a-propos|apropos|about|equipe|[ée]quipe|team|direction|notre-entreprise|staff|leadership|management)/i;
+  /(contact|nous-joindre|nous_joindre|joindre|coordonnees|coordonn[ée]es|a-propos|apropos|about|equipe|[ée]quipe|team|direction|notre-entreprise|staff|leadership|management|people|ppl|nos-gens|gens|board|administrateurs|directors|executives|partners|associates)/i;
 
 const COMMON_PATHS = [
+  "/people",
+  "/people/",
+  "/our-people",
+  "/ppl",
+  "/team",
+  "/our-team",
+  "/leadership",
+  "/board",
+  "/directors",
+  "/executives",
+  "/equipe",
+  "/notre-equipe",
+  "/direction",
+  "/about/people",
+  "/about/team",
+  "/about/leadership",
+  "/about-us/people",
   "/contact",
   "/contact.html",
   "/contactez-nous",
   "/nous-joindre",
   "/a-propos",
   "/about",
-  "/equipe",
-  "/team",
   "/coordonnees",
 ];
 
@@ -987,6 +1003,7 @@ export async function gatherEvidence(
     city: string | null;
     neq: string | null;
     postal_code?: string | null;
+    address?: string | null;
   },
   options: OsintOptions = {},
 ): Promise<Evidence> {
@@ -1023,6 +1040,7 @@ export async function gatherEvidence(
     neq: company.neq,
     city: company.city,
     postal_code: company.postal_code ?? null,
+    address: company.address ?? null,
     region,
     keywords: opt.keywords,
     sites: opt.customSites,
@@ -1051,6 +1069,10 @@ export async function gatherEvidence(
     `"${company.clean_name}" (président OR propriétaire OR directeur) courriel`,
   ];
   if (company.neq) queries.push(`"${company.neq}" ${company.clean_name}`);
+  if (company.address) {
+    queries.push(`"${company.address}" ${company.city ?? ""} contact courriel`);
+    queries.push(`"${company.address}" "${company.postal_code ?? ""}"`);
+  }
 
   const results = opt.web ? await Promise.all(queries.map((q) => webSearch(q))) : [];
   const links = Array.from(new Set(results.flatMap((r) => r.links)));
@@ -1265,7 +1287,19 @@ export async function gatherEvidence(
       for (const u of await fetchSitemapPages(origin)) internal.add(u);
     }
 
-    const urls = Array.from(internal).slice(0, 8);
+    const urls = Array.from(internal)
+      .sort((a, b) => {
+        const aHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives)/i.test(a);
+        const bHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives)/i.test(b);
+        const aHasContact = /(contact|joindre|coordonnees)/i.test(a);
+        const bHasContact = /(contact|joindre|coordonnees)/i.test(b);
+        if (aHasPeople && !bHasPeople) return -1;
+        if (!aHasPeople && bHasPeople) return 1;
+        if (aHasContact && !bHasContact) return -1;
+        if (!aHasContact && bHasContact) return 1;
+        return 0;
+      })
+      .slice(0, 14);
     const pages = await Promise.all(urls.map((u) => safeFetch(u, 7000)));
     pages.forEach((page, i) => {
       if (page && urls[i]) sourceUrls.push(urls[i]!);
@@ -1295,7 +1329,7 @@ export async function gatherEvidence(
   // this is what produces personal addresses instead of department mailboxes.
   const patternCandidates =
     opt.patternEmails && domain
-      ? Array.from(new Set(people.slice(0, 3).flatMap((p) => emailPatterns(p.name, domain)))).slice(0, 12)
+      ? Array.from(new Set(people.slice(0, 6).flatMap((p) => emailPatterns(p.name, domain)))).slice(0, 24)
       : [];
 
 

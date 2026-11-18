@@ -128,6 +128,35 @@ export function employeeBandFromSourceRow(src: Record<string, unknown>): string 
   return null;
 }
 
+/**
+ * Extracts a physical street address from uploaded source row columns
+ * (e.g. adresse, address, street, rue, adr_domcl_lign1_adr, etc.)
+ */
+export function addressFromSourceRow(src: Record<string, unknown>): string | null {
+  if (!src || typeof src !== "object") return null;
+  for (const [key, value] of Object.entries(src)) {
+    const k = key.toString().replace(/^\uFEFF/, "").trim().toLowerCase();
+    if (
+      k === "address" ||
+      k === "adresse" ||
+      k === "street" ||
+      k === "rue" ||
+      k === "adresse_ligne_1" ||
+      k === "adresse_1" ||
+      k === "adresse 1" ||
+      k === "adr_domcl_lign1_adr" ||
+      k === "adr_domcl" ||
+      k === "adresse_domicile" ||
+      k === "adresse_etablissement"
+    ) {
+      if (typeof value === "string" && value.trim().length > 3) {
+        return value.trim();
+      }
+    }
+  }
+  return null;
+}
+
 /** REQ employee-count range codes and what they mean. */
 export const EMPLOYEE_BANDS = [
   { code: "O", label: "O — 0 employees / not declared", tiny: true },

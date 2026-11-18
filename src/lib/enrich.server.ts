@@ -15,7 +15,8 @@
 //    inboxes, computes confidence (0-5), and records provenance metadata.
 // ============================================================================
 import { buildReferences, collectiveScore, getEvidenceRubric, scoreLabel } from "./domain-authority";
-import { cleanCompanyName } from "./req";
+import { addressFromSourceRow, cleanCompanyName } from "./req";
+import { emailPatterns } from "./osint.server";
 import {
   guardRow,
   sharedDomainAllowed,
@@ -37,6 +38,15 @@ type AnySupabase = {
   rpc: (fn: string, args: Record<string, unknown>) => Promise<{ data: any; error: any }>;
 };
 
+export type AdditionalExecutive = {
+  name: string;
+  title: string;
+  email: string | null;
+  phone: string | null;
+  confidence: number;
+  status: "Verified" | "MX Verified" | "Unverified" | "Invalid";
+};
+
 export type EnrichResult = {
   executive_name: string | null;
   title: string | null;
@@ -53,6 +63,7 @@ export type EnrichResult = {
   company_status: string | null;
   email_type: "executive" | "company" | "personal" | "unknown";
   verification_details: Record<string, unknown>;
+  additional_executives?: AdditionalExecutive[];
 };
 
 
@@ -759,9 +770,67 @@ function candidateTier(
   return 1;
 }
 
+function buildAdditionalExecutives(
+  people: { name: string; title: string }[],
+  primaryName: string | null,
+  assessedEmails: { email: string; status: any; confidence: number }[],
+  domain: string | null,
+  phone: string | null,
+): AdditionalExecutive[] {
+  const seenNames = new Set<string>();
+  if (primaryName) seenNames.add(primaryName.trim().toLowerCase());
+
+  const result: AdditionalExecutive[] = [];
+
+  for (const person of people) {
+    if (!person.name || person.name.trim().length < 2) continue;
+    const norm = person.name.trim().toLowerCase();
+    if (seenNames.has(norm)) continue;
+    seenNames.add(norm);
+
+    // Check if any assessed email looks personal to this person
+    const matchedAssessed = assessedEmails.find(
+      (a) => a.email && looksPersonal(a.email, [person]) && a.status !== "Invalid",
+    );
+
+    let email: string | null = matchedAssessed?.email ?? null;
+    let status: AdditionalExecutive["status"] = matchedAssessed?.status ?? "Unverified";
+    let confidence: number = matchedAssessed?.confidence ?? 1;
+
+    // If no email directly matched, see if we can derive a first.last@domain pattern if domain has MX
+    if (!email && domain) {
+      const pats = emailPatterns(person.name, domain);
+      const matchedPat = pats.find((p) =>
+        assessedEmails.some((a) => a.email.toLowerCase() === p.toLowerCase() && a.status !== "Invalid"),
+      );
+      if (matchedPat) {
+        email = matchedPat;
+        status = "MX Verified";
+        confidence = 3;
+      }
+    }
+
+    result.push({
+      name: person.name.trim(),
+      title: person.title?.trim() || "Executive",
+      email,
+      phone,
+      confidence,
+      status,
+    });
+  }
+
+  return result;
+}
 
 export async function enrichCompany(
-  row: { company_name: string; city: string | null; postal_code: string | null; neq: string | null },
+  row: {
+    company_name: string;
+    city: string | null;
+    postal_code: string | null;
+    neq: string | null;
+    source_row?: Record<string, unknown>;
+  },
   model: string,
   keys: Record<string, string | null>,
   targets: EnrichTargets,
@@ -769,6 +838,7 @@ export async function enrichCompany(
   signal?: AbortSignal,
 ): Promise<EnrichResult> {
   const clean = cleanCompanyName(row.company_name);
+  const inputAddress = addressFromSourceRow(row.source_row ?? {});
 
   // ---------- STAGE 1 — OSINT: search engines, socials, site crawl ----------
   await onStep(`OSINT search started · "${clean}" · ${targets.region ?? "Canada"}${row.city ? ` · ${row.city}` : ""}`);
@@ -804,6 +874,7 @@ export async function enrichCompany(
         city: row.city,
         neq: row.neq,
         postal_code: row.postal_code,
+        address: inputAddress ?? undefined,
       },
       {
         registry: targets.registry,
@@ -900,7 +971,7 @@ export async function enrichCompany(
   }
 
   const extra = {
-    address: targets.address === false ? null : evidence.address,
+    address: targets.address === false ? null : (evidence.address ?? inputAddress),
     linkedin_url: evidence.socials.linkedin,
     facebook_url: evidence.socials.facebook,
     registry_url: evidence.registryUrl,
@@ -1090,6 +1161,14 @@ export async function enrichCompany(
     const chosenPerson =
       evidence.people.find((p) => looksPersonal(best!.cand.email, [p])) ?? person;
 
+    const additional_executives = buildAdditionalExecutives(
+      evidence.people,
+      chosenPerson?.name ?? null,
+      assessedEmails,
+      targets.domain === false ? null : (evidence.domain ?? best!.cand.email.split("@")[1]!),
+      phone,
+    );
+
     return {
       executive_name: chosenPerson?.name ?? null,
       title: chosenPerson?.title ?? null,
@@ -1111,6 +1190,7 @@ export async function enrichCompany(
           .sort((a, b) => STATUS_RANK[b.status] - STATUS_RANK[a.status] || b.confidence - a.confidence)
           .slice(0, 9),
       },
+      additional_executives,
       ...extra,
     };
   }
@@ -1120,9 +1200,20 @@ export async function enrichCompany(
   if (targets.useAiFallback === false) {
     await onStep("AI fallback disabled — returning OSINT-only result", "warn");
     const mx = evidence.domain ? await hasMx(evidence.domain, signal) : false;
+    const chosenPerson =
+      (best ? evidence.people.find((p) => looksPersonal(best.cand.email, [p])) : null) ?? person;
+
+    const additional_executives = buildAdditionalExecutives(
+      evidence.people,
+      chosenPerson?.name ?? null,
+      assessedEmails,
+      targets.domain === false ? null : evidence.domain,
+      phone,
+    );
+
     return {
-      executive_name: person?.name ?? null,
-      title: person?.title ?? null,
+      executive_name: chosenPerson?.name ?? null,
+      title: chosenPerson?.title ?? null,
       email: best?.cand.email ?? null,
       phone,
       domain: targets.domain === false ? null : evidence.domain,
@@ -1133,6 +1224,7 @@ export async function enrichCompany(
       verification_details: best
         ? { ...sourceMeta, signals: best.assessment.signals, reasons: best.assessment.reasons, alternate_emails: assessedEmails.filter((item) => item.email !== best?.cand.email && item.status !== "Invalid").slice(0, 9) }
         : { ...sourceMeta, reasons: ["No email discovered by OSINT"] },
+      additional_executives,
       ...extra,
     };
   }
@@ -1328,11 +1420,20 @@ Likely own-domain shapes: ${guessBases.join(", ")} (with .ca / .com / .qc.ca).`;
     `AI answer — domain ${aiDomain ?? "none"} · phone ${aiText("phone") ?? "none"} · address ${aiText("address") ?? "none"} · ${aiText("source") ?? "no source"}`,
   );
 
+  const primaryExecutive = aiText("executive_name") ?? person?.name ?? null;
+  const additional_executives = buildAdditionalExecutives(
+    evidence.people,
+    primaryExecutive,
+    assessedEmails,
+    targets.domain === false ? null : domain,
+    phone ?? (targets.phone === false ? null : (siteFound?.phones[0] ?? aiText("phone"))),
+  );
+
   return {
     ...extra,
     address:
       targets.address === false ? null : (evidence.address ?? siteFound?.address ?? aiText("address")),
-    executive_name: aiText("executive_name") ?? person?.name ?? null,
+    executive_name: primaryExecutive,
     title: aiText("title") ?? person?.title ?? null,
     email: verification === "Invalid" ? null : email,
     phone: phone ?? (targets.phone === false ? null : (siteFound?.phones[0] ?? aiText("phone"))),
@@ -1345,6 +1446,7 @@ Likely own-domain shapes: ${guessBases.join(", ")} (with .ca / .com / .qc.ca).`;
         : `AI (${model})${evidence.pagesScraped ? " + OSINT context" : ""}`,
     email_type: emailType,
     verification_details: { ...sourceMeta, ...details, ai_source: aiText("source") },
+    additional_executives,
   };
 
 }
@@ -1654,6 +1756,56 @@ export async function processJobBatch(
           email_type: result.email_type,
           verification_details: result.verification_details,
         });
+
+        // Store separate rows for any additional leadership executives discovered
+        if (result.additional_executives && result.additional_executives.length > 0) {
+          let extraSaved = 0;
+          for (const exec of result.additional_executives.slice(0, 10)) {
+            if (!exec.name) continue;
+            if (exec.name.trim().toLowerCase() === (result.executive_name ?? "").trim().toLowerCase()) continue;
+
+            await db.from("contacts").insert({
+              user_id: job.user_id,
+              job_id: jobId,
+              neq: row.neq,
+              company_name: row.company_name,
+              city: row.city,
+              postal_code: row.postal_code,
+              source_row: (row as { source_row?: Record<string, string> }).source_row ?? {},
+              executive_name: exec.name,
+              title: exec.title || result.title,
+              email: exec.email,
+              phone: exec.phone || result.phone,
+              domain: result.domain,
+              verification_status: exec.status,
+              confidence: exec.confidence,
+              source: `${result.source} (Executive leadership)`,
+              address: result.address,
+              linkedin_url: result.linkedin_url,
+              facebook_url: result.facebook_url,
+              registry_url: result.registry_url,
+              company_status: result.company_status,
+              email_type: exec.email
+                ? looksPersonal(exec.email, [{ name: exec.name }])
+                  ? "executive"
+                  : "company"
+                : "unknown",
+              verification_details: {
+                ...(result.verification_details ?? {}),
+                role_type: "leadership_team",
+                primary_executive: result.executive_name,
+              },
+            });
+            extraSaved++;
+          }
+          if (extraSaved > 0) {
+            await step(
+              `Stored ${extraSaved} additional leadership executive row(s) for ${row.company_name}`,
+              "info",
+            );
+          }
+        }
+
         await db
           .from("job_rows")
           .update({ status: "done", processed_at: new Date().toISOString(), error: null, heartbeat_at: new Date().toISOString() })

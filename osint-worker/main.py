@@ -74,7 +74,7 @@ UA = (
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:\+?1[\s.\-]?)?\(?([2-9]\d{2})\)?[\s.\-]?(\d{3})[\s.\-]?(\d{4})")
 EXEC_TITLE_RE = re.compile(
-    r"\b(Président|Présidente|Directeur Général|Directrice Générale|DG|Fondateur|Fondatrice|Propriétaire|CEO|President|Owner|Directeur|Directrice|VP|Vice-Président)\b",
+    r"\b(Président|Présidente|Directeur Général|Directrice Générale|DG|Fondateur|Fondatrice|Propriétaire|CEO|President|Owner|Directeur|Directrice|VP|Vice-Président|Vice-Présidente|Partner|Associé|Associée|Managing Director|General Manager|Principal|Executive Director|Administrateur|Administratrice|Leader)\b",
     re.IGNORECASE,
 )
 LEGAL_SUFFIX_RE = re.compile(
@@ -432,6 +432,40 @@ def norm_phone(m) -> str:
     return f"({m.group(1)}) {m.group(2)}-{m.group(3)}"
 
 
+def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
+    if not text:
+        return []
+    results = []
+    seen = set()
+    name_pat = r"([A-ZÀ-Ý][a-zà-ÿ'\-]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ'\-]+){1,2})"
+    title_words = (
+        r"(?:Président(?:e)?(?:[- ]Directeur[- ]Général)?|Vice[- ]Président(?:e)?|"
+        r"Directeur(?:trice)?(?:\s+Général(?:e)?|\s+d'[ée]tudes|\s+des\s+[ée]tudes)?|"
+        r"Propriétaire|Fondateur|Fondatrice|Associé(?:e)?|Gérant(?:e)?|Administrateur(?:trice)?|"
+        r"Recteur|Rectrice|Doyen(?:ne)?|Principal(?:e)?|Provost|Chancellor|Coordonnateur(?:trice)?|"
+        r"Secrétaire(?:\s+Général(?:e)?)?|Trésorier(?:ière)?|DG|PDG|"
+        r"Chief Executive Officer|CEO|CFO|COO|CTO|CMO|CRO|President|Owner|Founder|"
+        r"General Manager|Managing Director|Partner|Executive Director|Director|VP|Vice[- ]President)"
+    )
+    pats = [
+        re.compile(rf"{name_pat}\s*[,–—\-]\s*({title_words})", re.IGNORECASE),
+        re.compile(rf"({title_words})\s*[:,–—\-]\s*{name_pat}", re.IGNORECASE),
+    ]
+    for idx, pat in enumerate(pats):
+        for m in pat.finditer(text):
+            raw_name = m.group(1 if idx == 0 else 2).strip()
+            raw_title = m.group(2 if idx == 0 else 1).strip()
+            name = re.sub(
+                r"\s+(?:vice|président|directeur|directrice|president|ceo|owner|fondateur|associé|gérant|chief)$",
+                "", raw_name, flags=re.IGNORECASE
+            ).strip()
+            clean_norm = name.lower()
+            if len(name) >= 3 and clean_norm not in seen and len(results) < 25:
+                seen.add(clean_norm)
+                results.append({"name": name, "title": raw_title})
+    return results
+
+
 def mx_ok(domain: str) -> bool:
     try:
         import dns.resolver
@@ -676,6 +710,8 @@ class OsintIn(BaseModel):
     province: Optional[str] = "Quebec"
     country: Optional[str] = "Canada"
     domain: Optional[str] = None
+    address: Optional[str] = None
+    postal_code: Optional[str] = None
     extra_sites: List[str] = []
     sites: List[str] = []
     max_pages: int = 8
@@ -708,7 +744,7 @@ async def _osint_impl(body: OsintIn):
     phones: List[str] = []
     people: List[Dict[str, str]] = []
     socials: Dict[str, str] = {}
-    address: Optional[str] = None
+    address: Optional[str] = body.address
     domain = body.domain
     browser_budget = MAX_OSINT_BROWSER_FALLBACKS
     # Track raw execution data for frontend "pre-record activity" display
@@ -801,6 +837,31 @@ async def _osint_impl(body: OsintIn):
                     log.append(f"Registry match: {urlparse(ru).netloc}")
                     break
 
+    # 1c. Address-based fallback search (if domain not found and address provided)
+    if not domain and (body.address or address):
+        search_addr = body.address or address
+        log.append(f"Searching by address: '{search_addr}'")
+        addr_q = f'"{search_addr}" {city_str} Quebec contact courriel'
+        addr_urls = await search(
+            f"https://ca.search.yahoo.com/search?p={quote_plus(addr_q)}",
+            lambda h: not any(s in h for s in (*BAD_HOSTS, "facebook.com", "linkedin.com")),
+            allow_browser=True,
+        )
+        for au in addr_urls[:4]:
+            cand = await osint_fetch(au, wait_ms=600)
+            cand_html = cand["html"]
+            cand_text = clean_html_to_markdown(cand_html)
+            host = urlparse(au).netloc.lower().replace("www.", "")
+            if host and "." in host and not any(b in host for b in BAD_HOSTS):
+                add_raw_source(au, cand_html, ["address_fallback_match", "contact_info"], "address search match")
+                emails += clean_emails(EMAIL_RE.findall(cand_html))
+                phones += [norm_phone(m) for m in PHONE_RE.finditer(cand_text)]
+                people += extract_people_from_markdown(cand_text)
+                if not domain and trusted_company_page(cand_text, au, company_name, body.neq, None):
+                    domain = host
+                    log.append(f"Domain discovered via address search: {domain}")
+                    break
+
     # 2. SpiderFoot & theHarvester Recon Pass
     if domain:
         sf_info = await spiderfoot_recon_domain(domain)
@@ -824,6 +885,17 @@ async def _osint_impl(body: OsintIn):
     if domain:
         base = f"https://{domain}"
         pages = [base]
+        # Seed top executive leadership & people sub-paths
+        EXECUTIVE_SUBPATHS = [
+            "/people", "/people/", "/our-people", "/ppl",
+            "/team", "/our-team", "/leadership", "/board",
+            "/directors", "/executives", "/equipe", "/notre-equipe",
+            "/direction", "/about/people", "/about/team", "/about/leadership",
+            "/contact", "/contactez-nous", "/nous-joindre", "/about"
+        ]
+        for sub in EXECUTIVE_SUBPATHS:
+            pages.append(urljoin(base, sub))
+
         home = await osint_fetch(base)
         soup = BeautifulSoup(home["html"], "html.parser")
 
@@ -837,8 +909,13 @@ async def _osint_impl(body: OsintIn):
 
         for a in soup.select("a[href]"):
             t = (a.get_text() or "").lower() + " " + a["href"].lower()
-            if any(k in t for k in ("contact", "about", "propos", "equipe", "team", "direction", "nous", "joindre")):
-                pages.append(urljoin(base, a["href"]))
+            if any(k in t for k in (
+                "contact", "about", "propos", "equipe", "team", "direction", "nous", "joindre",
+                "people", "ppl", "leadership", "executives", "directors", "board", "staff", "partners", "nos-gens"
+            )):
+                full_url = urljoin(base, a["href"])
+                if urlparse(full_url).netloc.lower().replace("www.", "") == domain:
+                    pages.append(full_url)
 
         seen = set()
         for p in pages:
@@ -859,23 +936,15 @@ async def _osint_impl(body: OsintIn):
             phones_found = [norm_phone(m) for m in PHONE_RE.finditer(markdown_content)]
             if phones_found:
                 extraction_summary.append("phone_regex")
-            # Check for executive names in markdown
-            exec_lines = []
-            for line in markdown_content.splitlines():
-                line_clean = line.strip()
-                if EXEC_TITLE_RE.search(line_clean) and 10 < len(line_clean) < 90:
-                    exec_lines.append(line_clean)
-            if exec_lines:
-                extraction_summary.append("exec_title_pattern")
+
+            # Extract named executives with French & English leadership patterns
+            extracted_people = extract_people_from_markdown(markdown_content)
+            if extracted_people:
+                extraction_summary.append("exec_people_pattern")
+                people += extracted_people
 
             emails += emails_found
             phones += phones_found
-
-            # Extract named executives near hierarchy titles
-            for line in markdown_content.splitlines():
-                line_clean = line.strip()
-                if EXEC_TITLE_RE.search(line_clean) and 10 < len(line_clean) < 90:
-                    people.append({"name": line_clean, "title": ""})
 
             # Extract Social Handles
             page_soup = BeautifulSoup(page_html, "html.parser")
@@ -1032,6 +1101,15 @@ async def _osint_impl(body: OsintIn):
             points = "; ".join(src.get("extraction_points", []))
             log.append(f"[RAW EXECUTION] {url} | Source: {source_type} | Points: {points}")
 
+    seen_people = set()
+    deduped_people = []
+    for p in people:
+        name_clean = (p.get("name") or "").strip()
+        if name_clean and name_clean.lower() not in seen_people:
+            seen_people.add(name_clean.lower())
+            deduped_people.append(p)
+    people = deduped_people
+
     return {
         "ok": True,
         "domain": domain,
@@ -1039,7 +1117,7 @@ async def _osint_impl(body: OsintIn):
         "trusted_emails": trusted_emails[:10],
         "email_mx": verified_mx,
         "phones": phones,
-        "people": people[:5],
+        "people": people[:25],
         "address": address,
         "socials": socials,
         "linkedin": socials.get("linkedin.com"),

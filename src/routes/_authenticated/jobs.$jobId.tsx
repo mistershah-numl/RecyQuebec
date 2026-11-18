@@ -211,11 +211,13 @@ function JobDetail() {
           ) : (
             records.map((rec) => {
               const compClean = rec.key.replace(/^\[\d+\]\s*/, "").trim().toLowerCase();
-              const contact = contacts.find((c: any) => {
+              const matchingContacts = contacts.filter((c: any) => {
                 if (!c?.company_name) return false;
                 const cn = c.company_name.toLowerCase();
                 return compClean === cn || compClean.includes(cn) || cn.includes(compClean);
               });
+              const contact = matchingContacts[0] ?? null;
+              const additionalContacts = matchingContacts.slice(1);
 
               const score = contact
                 ? Number(contact.confidence ?? 0)
@@ -357,6 +359,37 @@ function JobDetail() {
                         </div>
                       </div>
                     </div>
+
+                    {/* Discovered Additional Leadership Executives */}
+                    {additionalContacts.length > 0 && (
+                      <div className="rounded-md border border-border/80 bg-muted/20 p-3 text-xs space-y-2">
+                        <div className="flex items-center gap-1.5 font-semibold text-foreground text-[11px]">
+                          <span>Additional Leadership Executives ({additionalContacts.length})</span>
+                        </div>
+                        <div className="divide-y divide-border/40">
+                          {additionalContacts.map((ac: any, aIdx: number) => (
+                            <div key={ac.id || aIdx} className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2 py-1.5 first:pt-0 last:pb-0">
+                              <div>
+                                <span className="font-medium text-foreground">{ac.executive_name || "—"}</span>
+                                {ac.title && <span className="text-[10px] text-muted-foreground block truncate">{ac.title}</span>}
+                              </div>
+                              <div className="font-mono text-emerald-600 dark:text-emerald-400">
+                                {ac.email || <span className="text-muted-foreground font-sans">No email</span>}
+                              </div>
+                              <div className="font-mono text-muted-foreground">
+                                {ac.phone || "—"}
+                              </div>
+                              <div className="flex items-center gap-1">
+                                <Badge variant="outline" className="text-[10px] font-mono">
+                                  {ac.verification_status || "Unverified"}
+                                </Badge>
+                                <span className="text-[10px] text-muted-foreground">Score {ac.confidence ?? 0}/5</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Extracted Evidence & Proof (HTML / Live Pages) */}
                     {rawSources.length > 0 && (
