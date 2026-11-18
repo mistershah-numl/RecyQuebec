@@ -14,6 +14,8 @@
 //    boilerplate filters, and correlates evidence across Quebec public records.
 // ============================================================================
 
+import { isBlockedSite, isFreeMailDomain, emailMatchesCompany, cleanDomain } from "./domain-guard";
+
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 
@@ -382,9 +384,19 @@ export async function workerOsint(input: {
     const d = (await res.json()) as Partial<WorkerOsintResult> & { ok?: boolean; trusted_emails?: string[] };
     if (d.ok === false) return null;
     const str = (v: unknown) => (typeof v === "string" ? v : null);
+    const sanitizeEmailList = (list: unknown[]): string[] =>
+      list
+        .filter((e): e is string => typeof e === "string" && Boolean(e.trim()))
+        .map((e) => e.trim().toLowerCase())
+        .filter((e) => {
+          const at = e.split("@");
+          const ed = cleanDomain(at[1]) || at[1]?.trim().toLowerCase();
+          return !ed || isFreeMailDomain(ed) || !isBlockedSite(ed);
+        });
+
     return {
-      emails: (d.emails ?? []).filter((e) => typeof e === "string").slice(0, 60),
-      trustedEmails: (d.trusted_emails ?? []).filter((e) => typeof e === "string").slice(0, 20),
+      emails: sanitizeEmailList(d.emails ?? []).slice(0, 60),
+      trustedEmails: sanitizeEmailList(d.trusted_emails ?? []).slice(0, 20),
       phones: (d.phones ?? []).filter((e) => typeof e === "string").slice(0, 40),
       people: (d.people ?? [])
         .filter((p) => p && typeof p.name === "string")
@@ -619,35 +631,52 @@ export async function webSearch(query: string): Promise<{ links: string[]; snipp
   };
 }
 
-function collectEmails(text: string, domainHint: string | null): string[] {
+function collectEmails(text: string, domainHint: string | null, companyName?: string | null): string[] {
   return Array.from(new Set((text.match(EMAIL_RE) ?? []).map((e) => e.toLowerCase())))
     .filter((e) => !/\.(png|jpg|jpeg|gif|svg|webp|css|js)$/.test(e))
-    .filter(
-      (e) =>
-        !/(sentry|example|domain\.com|wixpress|godaddy|squarespace|wordpress|shopify|cloudflare|email\.com|yourdomain|schema\.org)/.test(
+    .filter((e) => {
+      const at = e.split("@");
+      const local = at[0]?.trim();
+      const domain = cleanDomain(at[1]) || at[1]?.trim().toLowerCase();
+      if (!local || !domain) return false;
+      // Filter out technical boilerplate, tracking, and blocked platforms
+      if (
+        /(sentry|example|domain\.com|wixpress|godaddy|squarespace|wordpress|shopify|cloudflare|email\.com|yourdomain|schema\.org)/.test(
           e,
-        ),
-    )
+        )
+      ) {
+        return false;
+      }
+      if (!isFreeMailDomain(domain) && isBlockedSite(domain)) return false;
+      return true;
+    })
     .sort((a, b) => {
       const score = (x: string) => {
         const lx = x.split("@")[0] || "";
+        const dx = cleanDomain(x.split("@")[1]) || x.split("@")[1] || "";
         let s = 0;
 
         // Domain match gets highest priority
-        if (domainHint && x.endsWith(`@${domainHint}`)) s -= 8;
-        else if (domainHint) s += 2;
+        if (domainHint && (x.endsWith(`@${domainHint}`) || dx === domainHint)) s -= 10;
+        else if (domainHint && !isFreeMailDomain(dx)) s += 2;
+
+        // Company name match in email local part gets high priority
+        if (companyName && emailMatchesCompany(x, companyName)) s -= 8;
 
         // Executive keywords (Quebec/France/Belgium)
-        if (/^(direction|president|pdg|proprietaire|fondateur|dirigeant|directeur|directrice|gerant|gerante|ceo|cf|coo|cto|cmo|cro|gm|md|vp|responsable|manager|chef|ex\.)/.test(lx)) s -= 5;
-        if (/^(info|contact|admin|ventes|sales|service|support|bureau|accueil|comptabilite|accounting|courriel|email)@/.test(lx)) s -= 1;
-        if (/^(noreply|no-reply|donotreply|webmaster|postmaster|privacy|abuse|adresse|courriel)@/.test(lx)) s += 6;
+        if (
+          /^(direction|president|pdg|proprietaire|fondateur|dirigeant|directeur|directrice|gerant|gerante|ceo|cf|coo|cto|cmo|cro|gm|md|vp|responsable|manager|chef|ex\.)/.test(
+            lx,
+          )
+        )
+          s -= 5;
+        if (/^(info|contact|admin|ventes|sales|service|support|bureau|accueil|comptabilite|accounting|courriel|email)@?/.test(lx))
+          s -= 2;
+        if (/^(noreply|no-reply|donotreply|webmaster|postmaster|privacy|abuse|adresse|courriel)@?/.test(lx)) s += 6;
 
         // Personal email indicators (first.last, flast, first, etc.)
-        if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(lx)) s -= 2; // first.last pattern
+        if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(lx)) s -= 3; // first.last pattern
         if (/^[a-z]{4,}$/.test(lx)) s -= 1; // plain name
-
-        // Free email providers
-        if (/^(gmail|hotmail|outlook|yahoo|icloud|aol|protonmail|gmx|mail|zoho|live|msn|sympatico)@/.test(lx)) s += 3;
 
         return s;
       };
@@ -1229,7 +1258,7 @@ export async function gatherEvidence(
   const people = [...(tool?.people ?? []), ...registryPeople, ...collectPeople(joined)].filter(
     (p, i, arr) => arr.findIndex((q) => q.name.toLowerCase() === p.name.toLowerCase()) === i,
   );
-  const emails = collectEmails(joined, domain);
+  const emails = collectEmails(joined, domain, company.clean_name || company.name);
   const finalAddress =
     address ?? tool?.address ?? extractAddress(joined, company.postal_code ?? null) ?? null;
 

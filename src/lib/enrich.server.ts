@@ -16,7 +16,14 @@
 // ============================================================================
 import { buildReferences, collectiveScore, scoreLabel } from "./domain-authority";
 import { cleanCompanyName } from "./req";
-import { guardRow, sharedDomainAllowed } from "./domain-guard";
+import {
+  guardRow,
+  sharedDomainAllowed,
+  isBlockedSite,
+  isFreeMailDomain,
+  emailMatchesCompany,
+  cleanDomain,
+} from "./domain-guard";
 
 const DEFAULT_BATCH_SIZE = 2; // system default: one bounded concurrent wave per invocation
 export const MIN_BATCH_SIZE = 1;
@@ -313,14 +320,19 @@ async function dns(name: string, type: "MX" | "A" | "TXT", signal?: AbortSignal)
 
 /**
  * Big platform / vendor domains. An address on one of these is a support or
- * notification mailbox scraped from a cookie banner, hosting page or error
- * screen — never the contact of a small Quebec business.
+ * notification mailbox scraped from a cookie banner, hosting page, or marketplace
+ * (e.g. LightInTheBox, AliExpress, Temu, Amazon) — never the contact of a local business.
+ * Note: Consumer ISPs and webmail providers (Videotron, Bell, Telus, Gmail, etc.)
+ * are deliberately NOT treated as vendors here, as Quebec SMBs routinely rely on them.
  */
 const VENDOR_DOMAINS =
-  /^(?:.*\.)?(amazon|amazonaws|aws|google|googlemail|gstatic|youtube|microsoft|office365|outlook365|live|msn|apple|icloud|meta|facebook|instagram|whatsapp|linkedin|twitter|x|tiktok|paypal|stripe|shopify|wix|wixpress|squarespace|wordpress|automattic|godaddy|cloudflare|namecheap|hostinger|bluehost|mailchimp|sendgrid|mailgun|hubspot|salesforce|zendesk|intercom|sentry|adobe|oracle|ibm|yelp|indeed|glassdoor|tripadvisor|kijiji|pagesjaunes|yellowpages|canada411|bell|videotron|telus|rogers|例)\.[a-z.]{2,}$/i;
+  /^(?:.*\.)?(amazon|amazonaws|aws|google|gstatic|youtube|microsoft|office365|outlook365|apple|meta|facebook|instagram|whatsapp|linkedin|twitter|x|tiktok|paypal|stripe|shopify|wix|wixpress|squarespace|wordpress|automattic|godaddy|cloudflare|namecheap|hostinger|bluehost|mailchimp|sendgrid|mailgun|hubspot|salesforce|zendesk|intercom|sentry|adobe|oracle|ibm|yelp|indeed|glassdoor|tripadvisor|kijiji|pagesjaunes|yellowpages|canada411|lightinthebox|miniinthebox|aliexpress|alibaba|temu|shein|wish|dhgate|ebay|etsy|walmart|bestbuy|costco|homedepot|rona|canadiantire|wayfair|overstock|例)\.[a-z.]{2,}$/i;
 
 export function isVendorDomain(domain: string | null | undefined): boolean {
-  return Boolean(domain && VENDOR_DOMAINS.test(domain.toLowerCase()));
+  if (!domain) return false;
+  const d = domain.toLowerCase().trim();
+  if (isFreeMailDomain(d)) return false;
+  return isBlockedSite(d) || VENDOR_DOMAINS.test(d);
 }
 
 export type EmailAssessment = {
@@ -336,6 +348,8 @@ export type AssessContext = {
   origin: "own-domain" | "web" | "pattern" | "generic" | "ai";
   /** The company's confirmed web domain, when known. */
   companyDomain?: string | null;
+  /** Company name for verifying branded mailboxes (e.g. gourmandelice30@gmail.com). */
+  companyName?: string | null;
   /** Executive name the address is supposed to belong to. */
   personName?: string | null;
   /** Raw page text collected during OSINT, used to count corroborating sources. */
@@ -404,15 +418,27 @@ export async function assessEmail(email: string, ctx: AssessContext, signal?: Ab
   if (spf) reasons.push("Domain publishes an SPF sender policy");
   if (hasDmarc) reasons.push("Domain publishes a DMARC policy");
 
-  const freemail = FREEMAIL.has(domain);
+  const freemail = isFreeMailDomain(domain) || FREEMAIL.has(domain);
   const role = ROLE_LOCAL.test(local.replace(/[._-].*$/, "")) || ROLE_LOCAL.test(local);
   signals["freemail"] = freemail;
   signals["role_account"] = role;
 
-  const onCompanyDomain = Boolean(ctx.companyDomain && domain === ctx.companyDomain.toLowerCase());
+  const onCompanyDomain = Boolean(
+    ctx.companyDomain &&
+      (domain === ctx.companyDomain.toLowerCase() || domain.endsWith(`.${ctx.companyDomain.toLowerCase()}`)),
+  );
   signals["on_company_domain"] = onCompanyDomain;
   if (onCompanyDomain) reasons.push("Address is on the company's own web domain");
-  if (freemail) reasons.push("Free consumer mailbox — ownership cannot be proven by domain");
+
+  // Company match: does the local part directly identify the company name?
+  // Vital for Quebec & Canadian SMBs that use Gmail/Hotmail/Videotron (e.g. gourmandelice30@gmail.com).
+  const companyMatch = Boolean(ctx.companyName && emailMatchesCompany(email, ctx.companyName));
+  signals["company_match"] = companyMatch;
+  if (companyMatch) {
+    reasons.push(`Mailbox explicitly matches company name (${ctx.companyName})`);
+  } else if (freemail) {
+    reasons.push("Free consumer mailbox — ownership cannot be proven by domain");
+  }
 
   // Corroboration: how many distinct scraped documents literally contain it.
   const corpus = ctx.corpus ?? [];
@@ -433,31 +459,32 @@ export async function assessEmail(email: string, ctx: AssessContext, signal?: Ab
   signals["name_match"] = nameMatch;
   if (nameMatch) reasons.push(`Local part matches ${ctx.personName}`);
 
-  const email_type: EmailAssessment["email_type"] = freemail
-    ? "personal"
-    : role
+  const email_type: EmailAssessment["email_type"] = nameMatch || ctx.origin === "pattern"
+    ? "executive"
+    : companyMatch || role || onCompanyDomain
       ? "company"
-      : nameMatch || ctx.origin === "pattern"
-        ? "executive"
+      : freemail
+        ? "personal"
         : "unknown";
 
   // Scoring — evidence, not just DNS.
   let score = 1; // MX only
   if (spf || hasDmarc) score += 0.5;
   if (onCompanyDomain) score += 1.5;
+  if (companyMatch) score += 1.5; // Direct company brand match
   if (mentions >= 1) score += 1;
   if (mentions >= 2) score += 0.5;
   if (nameMatch) score += 1;
   if (ctx.origin === "pattern" && mentions === 0) score -= 1; // guessed, never seen published
   if (ctx.origin === "ai" && mentions === 0) score -= 1.5; // model output with no public trace
-  if (freemail && !nameMatch && mentions === 0) score -= 1;
+  if (freemail && !nameMatch && !companyMatch && mentions === 0) score -= 1;
   const confidence = Math.max(0, Math.min(5, Math.round(score)));
 
   let status: EmailAssessment["status"];
-  if (mentions >= 1 && (onCompanyDomain || nameMatch || mentions >= 2)) {
+  if (mentions >= 1 && (onCompanyDomain || companyMatch || nameMatch || mentions >= 2)) {
     status = "Verified";
     reasons.push("Cross-checked: deliverable and publicly attributed to this company/person");
-  } else if (mentions >= 1 || onCompanyDomain) {
+  } else if (mentions >= 1 || onCompanyDomain || companyMatch) {
     status = "MX Verified";
     reasons.push("Deliverable and seen publicly, but not attributed to a named person");
   } else {
@@ -643,18 +670,56 @@ function looksPersonal(email: string, people: { name: string }[]): boolean {
   return /^[a-z]{2,}[._-][a-z]{2,}$/.test(local);
 }
 
-/** Higher tier = closer to a named executive; generic mailboxes rank last. */
+/**
+ * Higher tier = closer to a confirmed executive or verified company mailbox.
+ * Tier hierarchy:
+ *  6: Named executive on confirmed company domain (e.g. j.tremblay@company.com)
+ *  5: Speculative pattern on company domain OR named executive on public provider
+ *  4.5: Company-matched mailbox on company's own domain
+ *  4: Branded company mailbox on public/ISP provider (e.g. gourmandelice30@gmail.com)
+ *  3.5: Role / department mailbox on company's own domain (info@, contact@)
+ *  2: Public web-scraped address or general mailbox
+ *  1: Fallback address
+ * -1: Drop / blocked platform address (LightInTheBox, AliExpress, Amazon, etc.)
+ */
 function candidateTier(
   email: string,
   origin: AssessContext["origin"],
   domain: string | null,
   people: { name: string }[],
+  companyName?: string | null,
 ): number {
-  const onOwn = !!domain && email.endsWith(`@${domain}`);
-  if (origin === "generic") return 0;
-  if (looksPersonal(email, people)) return onOwn ? 5 : 4;
-  if (origin === "pattern") return 4;
-  if (onOwn) return 2;
+  const at = email.split("@");
+  const local = at[0]?.toLowerCase() ?? "";
+  const mailDomain = at[1]?.toLowerCase() ?? "";
+
+  // Drop blocked / vendor platforms
+  if (!isFreeMailDomain(mailDomain) && isBlockedSite(mailDomain)) {
+    return -1;
+  }
+
+  const onOwn = !!domain && (mailDomain === domain.toLowerCase() || mailDomain.endsWith(`.${domain.toLowerCase()}`));
+  const isPersonal = looksPersonal(email, people);
+  const matchesCompany = Boolean(companyName && emailMatchesCompany(email, companyName));
+
+  // 1. Executive personal mailbox on own domain
+  if (isPersonal && onOwn) return 6;
+
+  // 2. Pattern candidate on own domain or personal mailbox on free-mail
+  if (origin === "pattern" && onOwn) return 5;
+  if (isPersonal) return 5;
+
+  // 3. Directly company-matched mailbox (e.g. gourmandelice30@gmail.com)
+  if (matchesCompany && onOwn) return 4.5;
+  if (matchesCompany) return 4;
+
+  // 4. Role / generic mailbox on company's own domain (info@domain.com, contact@domain.com)
+  if (onOwn) return 3.5;
+  if (origin === "generic") return 3.5;
+
+  // 5. Normal web-scraped email or own-domain unknown mailbox
+  if (origin === "web" || origin === "own-domain") return 2;
+
   return 1;
 }
 
@@ -796,18 +861,31 @@ export async function enrichCompany(
   const person = evidence.people[0] ?? null;
   if (person) await onStep(`Executive candidate: ${person.name}${person.title ? ` — ${person.title}` : ""}`);
   const corpus = [...evidence.snippets, ...evidence.emails];
-  // Drop platform/support mailboxes (amazon.com, wixpress.com…) that leak in
-  // from error pages, cookie banners and hosting boilerplate.
-  const scrapedEmails = evidence.emails.filter((e) => !isVendorDomain(e.split("@")[1] ?? ""));
+  // Drop platform/support/marketplace mailboxes (amazon.com, lightinthebox.com, wixpress.com…)
+  // that leak in from ads, widgets, cookie banners, or hosting boilerplate.
+  const scrapedEmails = evidence.emails.filter((e) => {
+    const at = e.split("@");
+    const d = cleanDomain(at[1]) || (at[1]?.toLowerCase() ?? "");
+    if (!d) return false;
+    if (isVendorDomain(d)) return false;
+    if (!isFreeMailDomain(d) && isBlockedSite(d)) return false;
+    return true;
+  });
   const droppedVendor = evidence.emails.length - scrapedEmails.length;
   if (droppedVendor > 0)
     await onStep(`Ignored ${droppedVendor} third-party platform address(es) found on scraped pages`, "warn");
+
   const ownDomainEmail =
-    (evidence.domain ? scrapedEmails.find((e) => e.endsWith(`@${evidence.domain}`)) : null) ?? null;
-  const scrapedEmail = ownDomainEmail ?? scrapedEmails[0] ?? null;
+    (evidence.domain
+      ? scrapedEmails.find((e) => e.endsWith(`@${evidence.domain}`) || e.endsWith(`.${evidence.domain}`))
+      : null) ?? null;
+  const companyMatchedEmail =
+    scrapedEmails.find((e) => emailMatchesCompany(e, row.company_name)) ?? null;
+  const scrapedEmail = ownDomainEmail ?? companyMatchedEmail ?? scrapedEmails[0] ?? null;
 
   const baseCtx = {
     companyDomain: evidence.domain,
+    companyName: row.company_name,
     personName: person?.name ?? null,
     corpus,
   };
@@ -829,11 +907,14 @@ export async function enrichCompany(
       raw.push({ email: g, origin: "generic", source: `Company mailbox on ${evidence.domain}` });
   }
 
-  // Executive-first ordering: named-person mailboxes are evaluated before
-  // department mailboxes, so a generic info@ can never win when a personal
-  // address exists for the same company.
+  // Executive-first ordering: named-person mailboxes and company-branded mailboxes
+  // are prioritized over generic catchalls, while third-party vendors are excluded.
   const candidates: Candidate[] = raw
-    .map((c) => ({ ...c, tier: candidateTier(c.email, c.origin, evidence.domain, evidence.people) }))
+    .map((c) => ({
+      ...c,
+      tier: candidateTier(c.email, c.origin, evidence.domain, evidence.people, row.company_name),
+    }))
+    .filter((c) => c.tier >= 0)
     .filter((c, i, arr) => arr.findIndex((o) => o.email.toLowerCase() === c.email.toLowerCase()) === i)
     .sort((a, b) => b.tier - a.tier);
 
@@ -1367,15 +1448,56 @@ export async function processJobBatch(
         {
           const g = guardRow({ company_name: row.company_name, domain: result.domain, email: result.email });
           for (const n of g.notes) await step(n, "warn");
-          if (result.email && !g.email) {
-            result.verification_status = "Unverified";
-            result.confidence = Math.min(result.confidence, 1);
+          let currentEmail = g.email;
+
+          if (result.email && !currentEmail) {
+            // The top candidate was rejected by guardRow (e.g. third-party platform).
+            // Fall back to the next best candidate from alternate_emails!
+            const alternates =
+              (result.verification_details?.alternate_emails as {
+                email: string;
+                status: any;
+                confidence: number;
+              }[]) ?? [];
+            let fallbackFound = false;
+            for (const alt of alternates) {
+              const altGuard = guardRow({ company_name: row.company_name, domain: g.domain, email: alt.email });
+              if (altGuard.email) {
+                await step(
+                  `Primary address was filtered by guard; falling back to alternative: ${altGuard.email} (${alt.status} · score ${alt.confidence}/5)`,
+                  "info",
+                );
+                currentEmail = altGuard.email;
+                result.verification_status = alt.status;
+                result.confidence = alt.confidence;
+                g.freeMail = altGuard.freeMail;
+                fallbackFound = true;
+                break;
+              }
+            }
+            if (!fallbackFound) {
+              result.verification_status = "Unverified";
+              result.confidence = Math.min(result.confidence, 1);
+            }
           }
+
           result.domain = g.domain;
-          result.email = g.email;
-          if (g.freeMail) {
-            result.confidence = Math.min(result.confidence, 3);
-            result.verification_details = { ...(result.verification_details ?? {}), free_mail_contact: true };
+          result.email = currentEmail;
+
+          if (g.freeMail && result.email) {
+            const matchesBiz = Boolean(
+              (row.company_name && emailMatchesCompany(result.email, row.company_name)) ||
+                (result.executive_name && looksPersonal(result.email, [{ name: result.executive_name }])),
+            );
+            // If the mailbox directly matches the Quebec company name or executive, allow full confidence
+            if (!matchesBiz) {
+              result.confidence = Math.min(result.confidence, 3);
+            }
+            result.verification_details = {
+              ...(result.verification_details ?? {}),
+              free_mail_contact: true,
+              company_name_match: matchesBiz,
+            };
           }
           if (result.domain) {
             const { data: sameSite } = await db
