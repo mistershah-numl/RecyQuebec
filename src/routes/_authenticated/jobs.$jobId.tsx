@@ -248,11 +248,11 @@ function JobDetail() {
                 const text = String(s.text || "");
                 if (text.includes("[RAW SOURCE]") || text.includes("[RAW EXECUTION]")) {
                   const urlMatch = text.match(/(https?:\/\/[^\s|]+)/);
-                  const url = urlMatch ? urlMatch[1] : "";
+                  const url = urlMatch?.[1] ?? "";
                   const typeMatch = text.match(/Type:\s*([^|]+)/);
-                  const type = typeMatch ? typeMatch[1].trim() : "Extraction Source";
+                  const type = typeMatch?.[1]?.trim() ?? "Extraction Source";
                   const ptsMatch = text.match(/Points:\s*([^|(]+)/);
-                  const points = ptsMatch ? ptsMatch[1].trim().split(", ") : [];
+                  const points = ptsMatch?.[1]?.trim() ? ptsMatch[1]!.trim().split(", ") : [];
                   const htmlMatch = text.match(/\(HTML:\s*([\s\S]*?)\)$/);
                   if (url && !seenUrls.has(url)) {
                     seenUrls.add(url);
@@ -260,7 +260,7 @@ function JobDetail() {
                       url,
                       selector: type,
                       points,
-                      htmlPreview: htmlMatch ? htmlMatch[1] : "",
+                      htmlPreview: htmlMatch?.[1] ?? "",
                     });
                   }
                 }

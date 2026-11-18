@@ -96,6 +96,20 @@ BAD_EMAIL_HINTS = (
 )
 BAD_HOSTS = ("duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com")
 
+# Directory / review portals — never accept these as a company's official domain.
+# Instead, scrape them for outbound links that may point to the real company website.
+DIRECTORY_DOMAINS = (
+    "restaurantguru.com", "yelp.com", "yelp.ca", "tripadvisor.com", "tripadvisor.ca",
+    "yellowpages.ca", "pagesjaunes.ca", "canada411.ca", "goldbook.ca", "411.ca",
+    "ubereats.com", "doordash.com", "skipthedishes.com", "grubhub.com",
+    "restomontreal.ca", "restoenligne.ca", "tastet.ca",
+    "cylex-canada.ca", "ourbis.ca", "kompass.com", "manta.com",
+    "b2bhint.com", "opencorporates.com", "societe.com", "zoominfo.com",
+    "crunchbase.com", "glassdoor.com", "indeed.com", "dnb.com",
+    "can1business.com", "opengovca.com", "quebeccompanies.com",
+    "bbb.org", "trustpilot.com", "foursquare.com",
+)
+
 CANADA_RE = re.compile(
     r"\b(canada|canadian|qu[ée]bec|quebec|montr[ée]al|montreal|ottawa|toronto|vancouver|calgary|"
     r"edmonton|winnipeg|halifax|saskatoon|regina|new brunswick|nova scotia|ontario|alberta|"
@@ -112,6 +126,60 @@ FOREIGN_LOCATION_RE = re.compile(
     r"royaume-uni|australia|australie|united states|[A-Z]{2}\s+\d{5}(?:-\d{4})?)\b",
     re.IGNORECASE,
 )
+
+
+def is_directory_host(host: str) -> bool:
+    """Returns True when `host` is a known directory / review portal."""
+    host = host.lower().replace("www.", "")
+    return any(host == d or host.endswith("." + d) for d in DIRECTORY_DOMAINS)
+
+
+def name_matches_host(company_name: str, trade_names: List[str], host: str) -> bool:
+    """True when the company (or one of its trade names) plausibly matches the hostname."""
+    host = host.lower().replace("www.", "")
+    base = host.split(".")[0].replace("-", "").replace("_", "")
+    if not base or len(base) < 3:
+        return False
+    flat = host.replace(".", "").replace("-", "")
+    all_names = [company_name] + list(trade_names)
+    for name in all_names:
+        token = deaccent(LEGAL_SUFFIX_RE.sub(" ", name).strip()).replace(" ", "")
+        if not token or len(token) < 3:
+            continue
+        if flat.startswith(token[:8]) or token.startswith(base[:8]):
+            return True
+        if base in token or token in flat:
+            return True
+        # Partial head match (at least 5 chars)
+        head = token[:max(5, min(8, len(token)))]
+        if base.startswith(head) or head.startswith(base[:6]):
+            return True
+    return False
+
+
+def extract_outbound_company_links(html: str, company_name: str, trade_names: List[str]) -> List[str]:
+    """From a directory listing page, extract outbound <a> links whose host
+    resembles the company name — these are likely the official website."""
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    outbound: List[str] = []
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if not href.startswith("http"):
+            continue
+        host = urlparse(href).netloc.lower().replace("www.", "")
+        if not host or "." not in host:
+            continue
+        # Skip links pointing back to the directory itself or social/search
+        if is_directory_host(host) or any(b in host for b in BAD_HOSTS):
+            continue
+        if any(s in host for s in ("facebook.com", "linkedin.com", "instagram.com", "twitter.com", "x.com", "youtube.com")):
+            continue
+        if name_matches_host(company_name, trade_names, host):
+            if href not in outbound:
+                outbound.append(href)
+    return outbound[:5]
 
 # Optional Stealth integration
 try:
@@ -715,6 +783,10 @@ class OsintIn(BaseModel):
     extra_sites: List[str] = []
     sites: List[str] = []
     max_pages: int = 8
+    # REQ economic activity description (e.g. "Fourniture de services informatiques")
+    activity: Optional[str] = None
+    # Active trade names / DBA from REQ (e.g. ["NETTOYEUR INDUSTRIEL PRO/MAX"])
+    trade_names: List[str] = []
 
 
 @app.post("/osint")
@@ -746,6 +818,8 @@ async def _osint_impl(body: OsintIn):
     socials: Dict[str, str] = {}
     address: Optional[str] = body.address
     domain = body.domain
+    input_activity = (body.activity or "").strip()
+    input_trade_names = [t.strip() for t in (body.trade_names or []) if t.strip()]
     browser_budget = MAX_OSINT_BROWSER_FALLBACKS
     # Track raw execution data for frontend "pre-record activity" display
     raw_execution_sources: List[Dict[str, Any]] = []
@@ -770,17 +844,24 @@ async def _osint_impl(body: OsintIn):
         log.append(f"[RAW] Source: {url} - Extraction points: {', '.join(extraction_points[:3])}")
 
     clean_name = LEGAL_SUFFIX_RE.sub("", company_name).strip()
+    # Use first trade name as search alias if available (numbered companies)
+    search_name = input_trade_names[0] if input_trade_names else clean_name
     city_str = body.city or ""
-    q_base = f'"{clean_name}" {city_str} {body.province or ""} {body.country or ""}'.strip()
+    q_base = f'"{search_name}" {city_str} {body.province or ""} {body.country or ""}'.strip()
 
-    # 1. Official Domain Discovery
+    # 1. Official Domain Discovery (with directory-trap protection)
     if not domain:
-        log.append(f"Searching official domain for '{clean_name}'")
+        log.append(f"Searching official domain for '{search_name}'")
         search_candidates = [
             f"https://duckduckgo.com/html/?q={quote_plus(q_base + ' site officiel OR official website')}",
-            f"https://ca.search.yahoo.com/search?p={quote_plus(clean_name + ' ' + city_str + ' Quebec contact courriel')}",
-            f"https://ca.search.yahoo.com/search?p={quote_plus(clean_name + ' site officiel')}",
+            f"https://ca.search.yahoo.com/search?p={quote_plus(search_name + ' ' + city_str + ' Quebec contact courriel')}",
+            f"https://ca.search.yahoo.com/search?p={quote_plus(search_name + ' site officiel')}",
         ]
+        # Also search by trade names if the main name is a numbered corp
+        if input_trade_names and input_trade_names[0] != clean_name:
+            search_candidates.insert(0,
+                f"https://duckduckgo.com/html/?q={quote_plus(input_trade_names[0] + ' ' + city_str + ' Quebec site officiel')}"
+            )
         urls = []
         for s_url in search_candidates:
             urls = await search(
@@ -795,7 +876,51 @@ async def _osint_impl(body: OsintIn):
             candidate_page = await osint_fetch(u, wait_ms=500)
             candidate_html = candidate_page["html"]
             candidate_text = clean_html_to_markdown(candidate_html)
+
+            # --- DIRECTORY TRAP: If this is a directory portal, do NOT adopt its
+            # domain. Instead, extract outbound links that may point to the real
+            # company website and mine the directory page for contact data. ---
+            if is_directory_host(host):
+                log.append(f"Directory detected: {host} — extracting outbound company links")
+                # Mine directory listing for emails/phones/people
+                emails += clean_emails(EMAIL_RE.findall(candidate_html))
+                phones += [norm_phone(m) for m in PHONE_RE.finditer(candidate_text)]
+                people += extract_people_from_markdown(candidate_text)
+                add_raw_source(u, candidate_html,
+                    ["directory_listing", "outbound_links", "contact_extraction"],
+                    f"directory:{host}")
+                # Follow outbound links to the real company site
+                outbound = extract_outbound_company_links(
+                    candidate_html, company_name, input_trade_names)
+                for ob_url in outbound:
+                    ob_host = urlparse(ob_url).netloc.lower().replace("www.", "")
+                    if is_directory_host(ob_host):
+                        continue
+                    ob_page = await osint_fetch(ob_url, wait_ms=600)
+                    ob_text = clean_html_to_markdown(ob_page["html"])
+                    # Validate: must be Canadian, not a foreign lookalike
+                    if FOREIGN_LOCATION_RE.search(ob_text) and not CANADA_RE.search(ob_text):
+                        log.append(f"Rejected foreign domain from directory link: {ob_host}")
+                        continue
+                    domain = ob_host
+                    log.append(f"Domain extracted from directory outbound link: {domain}")
+                    add_raw_source(ob_url, ob_page["html"],
+                        ["domain_verification", "directory_outbound"],
+                        "directory extracted domain")
+                    break
+                continue  # Don't adopt the directory host as domain
+
+            # --- FOREIGN LOOKALIKE CHECK: Reject domains whose pages show
+            # foreign evidence (France, Belgium, etc.) without Canadian markers ---
             if host and "." in host and trusted_company_page(candidate_text, u, company_name, body.neq, None):
+                # Additional foreign-evidence check on the domain's own page
+                if FOREIGN_LOCATION_RE.search(candidate_text) and not CANADA_RE.search(candidate_text):
+                    log.append(f"Rejected foreign lookalike domain: {host} (foreign location markers, no Canadian evidence)")
+                    continue
+                # Also reject if the host doesn't plausibly match the company name
+                if not name_matches_host(company_name, input_trade_names, host):
+                    log.append(f"Rejected unrelated domain: {host} (hostname does not match company)")
+                    continue
                 domain = host
                 log.append(f"Validated Canadian domain: {domain}")
                 # Log raw HTML source for domain page
@@ -852,7 +977,7 @@ async def _osint_impl(body: OsintIn):
             cand_html = cand["html"]
             cand_text = clean_html_to_markdown(cand_html)
             host = urlparse(au).netloc.lower().replace("www.", "")
-            if host and "." in host and not any(b in host for b in BAD_HOSTS):
+            if host and "." in host and not any(b in host for b in BAD_HOSTS) and not is_directory_host(host):
                 add_raw_source(au, cand_html, ["address_fallback_match", "contact_info"], "address search match")
                 emails += clean_emails(EMAIL_RE.findall(cand_html))
                 phones += [norm_phone(m) for m in PHONE_RE.finditer(cand_text)]
@@ -861,6 +986,18 @@ async def _osint_impl(body: OsintIn):
                     domain = host
                     log.append(f"Domain discovered via address search: {domain}")
                     break
+
+    # 1d. Final foreign-lookalike guard: if we chose a domain, verify its homepage
+    # is not from a foreign country with the same company name.
+    if domain and not is_directory_host(domain):
+        try:
+            verify_page = await osint_fetch(f"https://{domain}", wait_ms=600)
+            verify_text = clean_html_to_markdown(verify_page["html"])
+            if FOREIGN_LOCATION_RE.search(verify_text) and not CANADA_RE.search(verify_text):
+                log.append(f"Domain {domain} rejected at final foreign-check (page shows foreign location, no Canadian evidence)")
+                domain = None
+        except Exception:
+            pass
 
     # 2. SpiderFoot & theHarvester Recon Pass
     if domain:

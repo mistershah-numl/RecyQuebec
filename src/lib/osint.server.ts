@@ -30,7 +30,9 @@ const BAD_DOMAINS = [
   ...SOCIAL_DOMAINS,
   "youtube.com",
   "tiktok.com",
+  // Directory / review portals — never adopt as a company's official domain
   "yelp.com",
+  "yelp.ca",
   "pagesjaunes.ca",
   "yellowpages.ca",
   "canada411.ca",
@@ -73,6 +75,23 @@ const BAD_DOMAINS = [
   "zone-renovation.com",
   "construction.qc.ca",
   "entrepri-renov.qc.ca",
+  // Restaurant / food delivery portals
+  "restaurantguru.com",
+  "restomontreal.ca",
+  "restoenligne.ca",
+  "tastet.ca",
+  "ubereats.com",
+  "doordash.com",
+  "skipthedishes.com",
+  "grubhub.com",
+  // Travel / review portals
+  "tripadvisor.com",
+  "tripadvisor.ca",
+  "foursquare.com",
+  "bbb.org",
+  "trustpilot.com",
+  "goldbook.ca",
+  "411.ca",
 ];
 
 // Executive title patterns for more accurate detection
@@ -182,7 +201,7 @@ export type Evidence = {
   /** Every page URL that was successfully read while building this evidence. */
   sourceUrls: string[];
   /** Detailed raw execution sources with HTML previews for data extraction provenance. */
-  rawExecutionSources?: Array<{
+  rawExecutionSources: Array<{
     url: string;
     selector: string;
     extraction_points: string[];
@@ -364,6 +383,8 @@ export async function workerOsint(input: {
   region: string;
   keywords: string;
   sites: string[];
+  activity?: string | null;
+  trade_names?: string[];
 }, parentSignal?: AbortSignal): Promise<WorkerOsintResult | null> {
   const base = runtimeWorker.url ?? process.env["OSINT_WORKER_URL"];
   const secret = runtimeWorker.secret ?? process.env["OSINT_WORKER_SECRET"];
@@ -389,6 +410,8 @@ export async function workerOsint(input: {
         extra_sites: input.sites,
         province: "Quebec",
         country: "Canada",
+        activity: input.activity ?? null,
+        trade_names: input.trade_names ?? [],
       }),
       signal: ctrl.signal,
     });
@@ -498,6 +521,7 @@ function inRegion(host: string | null, countryLock: boolean): boolean {
 }
 
 const CANADA_MARKER = /\b(canada|canadian|qu[ée]bec|montreal|montr[ée]al|ottawa|toronto|vancouver|calgary|edmonton|winnipeg|halifax|\b(?:QC|ON|BC|AB|MB|SK|NB|NS|PE|NL|YT|NT|NU)\b|[A-Z]\d[A-Z][ -]?\d[A-Z]\d)\b/i;
+const FOREIGN_LOCATION_MARKER = /\b(france|paris|lyon|marseille|belgique|belgium|suisse|switzerland|united kingdom|royaume-uni|australia|australie|united states|retournac|nantes|bordeaux|strasbourg|lille|toulouse|nice|rennes|rouen)\b/i;
 
 function evidenceMatchesCompany(text: string, company: string, neq: string | null): boolean {
   return mentionsCompany(text, companyTokens(company), neq, null);
@@ -1002,8 +1026,12 @@ export async function gatherEvidence(
     clean_name: string;
     city: string | null;
     neq: string | null;
-    postal_code?: string | null;
-    address?: string | null;
+    postal_code?: string | null | undefined;
+    address?: string | null | undefined;
+    /** REQ economic activity description, e.g. "Fourniture de services informatiques". */
+    activity?: string | null | undefined;
+    /** Active trade names / DBA from REQ, e.g. ["NETTOYEUR INDUSTRIEL PRO/MAX"]. */
+    trade_names?: string[] | undefined;
   },
   options: OsintOptions = {},
 ): Promise<Evidence> {
@@ -1044,6 +1072,8 @@ export async function gatherEvidence(
     region,
     keywords: opt.keywords,
     sites: opt.customSites,
+    activity: company.activity ?? null,
+    trade_names: company.trade_names ?? [],
   }, options.signal);
   if (tool) {
     trail.push(
@@ -1265,59 +1295,70 @@ export async function gatherEvidence(
     const internal = new Set<string>();
 
     if (home) {
-      pagesScraped++;
-      sourceUrls.push(candidate);
-      texts.push(stripHtml(home).slice(0, 10_000));
-      texts.push((home.match(/mailto:[^"'>\s]+/gi) ?? []).join(" "));
+      // --- Foreign lookalike guard: reject domain whose homepage shows
+      // foreign location markers (France, Belgium, etc.) without Canadian evidence ---
+      const homeText = stripHtml(home).slice(0, 10_000);
+      if (FOREIGN_LOCATION_MARKER.test(homeText) && !CANADA_MARKER.test(homeText)) {
+        trail.push(`domain ${domain} rejected (foreign location on homepage, no Canadian evidence)`);
+        domain = null;
+        candidate = null;
+      } else {
+        pagesScraped++;
+        sourceUrls.push(candidate);
+        texts.push(homeText);
+        texts.push((home.match(/mailto:[^"'>\s]+/gi) ?? []).join(" "));
 
-      for (const m of home.matchAll(/href="([^"#]+)"/gi)) {
-        const href = m[1]!.replace(/&amp;/g, "&");
-        if (!CONTACT_HINT.test(href)) continue;
-        try {
-          const abs = new URL(href, candidate).toString();
-          if (hostOf(abs) === domain) internal.add(abs);
-        } catch {
-          /* ignore */
+        for (const m of home.matchAll(/href="([^"#]+)"/gi)) {
+          const href = m[1]!.replace(/&amp;/g, "&");
+          if (!CONTACT_HINT.test(href)) continue;
+          try {
+            const abs = new URL(href, candidate).toString();
+            if (hostOf(abs) === domain) internal.add(abs);
+          } catch {
+            /* ignore */
+          }
         }
       }
     }
 
-    if (opt.deepCrawl) {
+    if (domain && opt.deepCrawl) {
       for (const p of COMMON_PATHS) internal.add(`${origin}${p}`);
       for (const u of await fetchSitemapPages(origin)) internal.add(u);
     }
 
-    const urls = Array.from(internal)
-      .sort((a, b) => {
-        const aHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives)/i.test(a);
-        const bHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives)/i.test(b);
-        const aHasContact = /(contact|joindre|coordonnees)/i.test(a);
-        const bHasContact = /(contact|joindre|coordonnees)/i.test(b);
-        if (aHasPeople && !bHasPeople) return -1;
-        if (!aHasPeople && bHasPeople) return 1;
-        if (aHasContact && !bHasContact) return -1;
-        if (!aHasContact && bHasContact) return 1;
-        return 0;
-      })
-      .slice(0, 14);
-    const pages = await Promise.all(urls.map((u) => safeFetch(u, 7000)));
-    pages.forEach((page, i) => {
-      if (page && urls[i]) sourceUrls.push(urls[i]!);
-    });
-    for (const page of pages) {
-      if (!page) continue;
-      pagesScraped++;
-      texts.push(stripHtml(page).slice(0, 10_000));
-      texts.push((page.match(/mailto:[^"'>\s]+/gi) ?? []).join(" "));
+    if (domain) {
+      const urls = Array.from(internal)
+        .sort((a, b) => {
+          const aHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives)/i.test(a);
+          const bHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives)/i.test(b);
+          const aHasContact = /(contact|joindre|coordonnees)/i.test(a);
+          const bHasContact = /(contact|joindre|coordonnees)/i.test(b);
+          if (aHasPeople && !bHasPeople) return -1;
+          if (!aHasPeople && bHasPeople) return 1;
+          if (aHasContact && !bHasContact) return -1;
+          if (!aHasContact && bHasContact) return 1;
+          return 0;
+        })
+        .slice(0, 14);
+      const pages = await Promise.all(urls.map((u) => safeFetch(u, 7000)));
+      pages.forEach((page, i) => {
+        if (page && urls[i]) sourceUrls.push(urls[i]!);
+      });
+      for (const page of pages) {
+        if (!page) continue;
+        pagesScraped++;
+        texts.push(stripHtml(page).slice(0, 10_000));
+        texts.push((page.match(/mailto:[^"'>\s]+/gi) ?? []).join(" "));
+      }
+      trail.push(`crawled ${pagesScraped} pages`);
     }
-    trail.push(`crawled ${pagesScraped} pages`);
   }
 
   const joined = texts.join("\n");
   const people = [...(tool?.people ?? []), ...registryPeople, ...collectPeople(joined)].filter(
     (p, i, arr) => arr.findIndex((q) => q.name.toLowerCase() === p.name.toLowerCase()) === i,
   );
-  const emails = collectEmails(joined, domain, company.clean_name || company.name);
+  const emails = collectEmails(joined, domain, company.clean_name || company.company_name);
   const finalAddress =
     address ?? tool?.address ?? extractAddress(joined, company.postal_code ?? null) ?? null;
 
@@ -1352,7 +1393,7 @@ export async function gatherEvidence(
     statusConfirmations,
     statusVotes,
     sourceUrls: Array.from(new Set([...sourceUrls, ...(socials.linkedin ? [socials.linkedin] : []), ...(socials.facebook ? [socials.facebook] : [])])).slice(0, 30),
-    rawExecutionSources: tool?.rawExecutionSources?.slice(0, 20),
+    rawExecutionSources: tool?.rawExecutionSources?.slice(0, 20) ?? [],
   };
 }
 

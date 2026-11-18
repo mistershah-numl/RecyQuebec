@@ -15,7 +15,7 @@
 //    inboxes, computes confidence (0-5), and records provenance metadata.
 // ============================================================================
 import { buildReferences, collectiveScore, getEvidenceRubric, scoreLabel } from "./domain-authority";
-import { addressFromSourceRow, cleanCompanyName } from "./req";
+import { addressFromSourceRow, activityFromSourceRow, tradeNamesFromSourceRow, cleanCompanyName } from "./req";
 import { emailPatterns } from "./osint.server";
 import {
   guardRow,
@@ -839,6 +839,8 @@ export async function enrichCompany(
 ): Promise<EnrichResult> {
   const clean = cleanCompanyName(row.company_name);
   const inputAddress = addressFromSourceRow(row.source_row ?? {});
+  const inputActivity = activityFromSourceRow(row.source_row ?? {});
+  const inputTradeNames = tradeNamesFromSourceRow(row.source_row ?? {});
 
   // ---------- STAGE 1 — OSINT: search engines, socials, site crawl ----------
   await onStep(`OSINT search started · "${clean}" · ${targets.region ?? "Canada"}${row.city ? ` · ${row.city}` : ""}`);
@@ -862,6 +864,12 @@ export async function enrichCompany(
     statusConfirmations: 0,
     statusVotes: [] as { status: string; raw: string; host: string; labeled: boolean }[],
     sourceUrls: [] as string[],
+    rawExecutionSources: [] as Array<{
+      url: string;
+      selector: string;
+      extraction_points: string[];
+      html_preview: string;
+    }>,
   };
   if (targets.skipOsint) {
     await onStep("AI-only mode — skipping OSINT crawling, asking the AI agent directly", "warn");
@@ -875,6 +883,8 @@ export async function enrichCompany(
         neq: row.neq,
         postal_code: row.postal_code,
         address: inputAddress ?? undefined,
+        activity: inputActivity ?? undefined,
+        trade_names: inputTradeNames,
       },
       {
         registry: targets.registry,
@@ -1239,7 +1249,7 @@ export async function enrichCompany(
 
   const header = `Company: ${clean}
 Legal name: ${row.company_name}
-NEQ: ${row.neq ?? "unknown"}
+${inputTradeNames.length ? `Known trade names (REQ / DBA): ${inputTradeNames.join(", ")}\n` : ""}${inputActivity ? `Official economic activity (REQ): ${inputActivity}\n` : ""}NEQ: ${row.neq ?? "unknown"}
 City: ${row.city ?? "Quebec"}
 Postal code: ${row.postal_code ?? "unknown"}
 Country: Canada
@@ -1251,13 +1261,15 @@ Needed: ${need}`;
   // so even AI-only mode and empty scrapes get fresh internet facts in the prompt.
   const { webSearch } = await import("./osint.server");
   const city = row.city ?? "Québec";
+  const searchName = inputTradeNames[0] || clean;
   const queries = [
     `"${clean}" ${city} Québec`,
-    `"${clean}" ${city} téléphone adresse contact`,
-    `"${clean}" courriel OR email OR contact`,
-    `"${clean}" site officiel OR website`,
-    row.neq ? `"${row.neq}" ${clean}` : `"${clean}" pagesjaunes OR canada411 OR linkedin`,
-  ];
+    inputTradeNames.length ? `"${inputTradeNames[0]}" ${city} Québec` : null,
+    `"${searchName}" ${city} téléphone adresse contact`,
+    `"${searchName}" courriel OR email OR contact`,
+    `"${searchName}" site officiel OR website`,
+    row.neq ? `"${row.neq}" ${clean}` : `"${searchName}" pagesjaunes OR canada411 OR linkedin`,
+  ].filter((q): q is string => Boolean(q));
   let liveLinks: string[] = [];
   let liveSnippets: string[] = [];
   try {
@@ -1609,7 +1621,7 @@ export async function processJobBatch(
             // The top candidate was rejected by guardRow (e.g. third-party platform).
             // Fall back to the next best candidate from alternate_emails!
             const alternates =
-              (result.verification_details?.alternate_emails as {
+              (result.verification_details?.["alternate_emails"] as {
                 email: string;
                 status: any;
                 confidence: number;

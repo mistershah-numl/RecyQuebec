@@ -157,6 +157,69 @@ export function addressFromSourceRow(src: Record<string, unknown>): string | nul
   return null;
 }
 
+/**
+ * Extracts the economic activity / role description from REQ columns
+ * (e.g. DESC_ACT_ECON_ASSUJ, description activite, activite economique, etc.)
+ */
+export function activityFromSourceRow(src: Record<string, unknown>): string | null {
+  if (!src || typeof src !== "object") return null;
+  for (const [key, value] of Object.entries(src)) {
+    const k = key.toString().replace(/^\uFEFF/, "").trim().toLowerCase();
+    if (
+      k === "desc_act_econ_assuj" ||
+      k === "desc_act_econ" ||
+      k === "description_activite" ||
+      k === "description activité" ||
+      k === "activite" ||
+      k === "activité" ||
+      k === "activite_economique" ||
+      k === "activité économique" ||
+      k === "secteur" ||
+      k === "secteur_activite" ||
+      k === "industry" ||
+      k === "domaine"
+    ) {
+      if (typeof value === "string") {
+        const v = value.trim();
+        if (v.length > 2 && v !== "-") return v;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Extracts trade names / DBA / alternate active names from REQ columns
+ * (e.g. AUTRES_NOMS_ACTIFS, NOM_ASSUJ_LANG_ETRNG, etc.)
+ */
+export function tradeNamesFromSourceRow(src: Record<string, unknown>): string[] {
+  if (!src || typeof src !== "object") return [];
+  const names: string[] = [];
+  for (const [key, value] of Object.entries(src)) {
+    const k = key.toString().replace(/^\uFEFF/, "").trim().toLowerCase();
+    if (
+      k === "autres_noms_actifs" ||
+      k === "autre_nom_actif" ||
+      k === "autre nom" ||
+      k === "autres noms" ||
+      k === "nom_assuj_lang_etrng" ||
+      k === "nom commercial" ||
+      k === "dba" ||
+      k === "trade_name" ||
+      k === "trade name" ||
+      k === "trade_names"
+    ) {
+      if (typeof value === "string" && value.trim().length > 1 && value.trim() !== "-") {
+        for (const part of value.split(";")) {
+          const clean = part.trim();
+          if (clean.length > 1 && !names.includes(clean)) names.push(clean);
+        }
+      }
+    }
+  }
+  return names;
+}
+
 /** REQ employee-count range codes and what they mean. */
 export const EMPLOYEE_BANDS = [
   { code: "O", label: "O — 0 employees / not declared", tiny: true },
