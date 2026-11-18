@@ -1,11 +1,18 @@
-// Server-only OSINT collection: multi-engine web search, social profile
-// discovery (LinkedIn / Facebook), direct domain probing, sitemap + contact
-// page scraping, and email-pattern generation.
-//
-// NOTE: Playwright / Scrapy are Python / Node-native tools that cannot run in
-// the edge worker runtime this app is deployed to. Everything below is plain
-// HTTP fetching + HTML parsing, which is exactly what those tools end up doing
-// for these mostly static pages — just without a browser process.
+// ============================================================================
+// RECYC OSINT - EXECUTIVE & CORPORATE INTELLIGENCE ENGINE (SERVER RUNTIME)
+// ============================================================================
+// Core responsibilities:
+// 1. Multi-Engine SERP Discovery: Queries Google, DuckDuckGo & Canadian registries
+//    with targeted French & English query permutations (site:, contact, direction).
+// 2. Hybrid Worker Integration: Handoff to external Playwright/Python worker
+//    (running on Google Colab or VPS via ngrok) for JS-rendered & bot-protected sites.
+// 3. Executive Contact Mining: Heuristic parsing of Quebec corporate leadership titles
+//    (Président, Directeur Général, DG, Fondateur, CEO, Owner, Administrateur).
+// 4. Domain & Permutation Synthesis: Generates structured first.last@domain candidate
+//    mailboxes from verified executive names.
+// 5. Verification & Reverse Cross-Check: Resolves MX DNS records, evaluates platform
+//    boilerplate filters, and correlates evidence across Quebec public records.
+// ============================================================================
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";

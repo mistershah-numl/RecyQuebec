@@ -1,4 +1,19 @@
-// Server-only enrichment worker. Bounded, idempotent, lease-protected.
+// ============================================================================
+// RECYC OSINT - ENRICHMENT & QUEUE ORCHESTRATION PIPELINE (SERVER-SIDE)
+// ============================================================================
+// Multi-Stage Processing Pipeline:
+// 1. Queue Lease & Claim: Atomically claims queued company records using
+//    PostgreSQL RPC `claim_job_rows` with SKIP LOCKED to prevent duplicate work.
+// 2. Stage 1 (OSINT & Heuristics): Mines corporate registries (REQ by NEQ),
+//    searches Google/DuckDuckGo, crawls company domains, and parses executive cards.
+// 3. Stage 1b (Reverse Verification): Cross-references extracted emails and phones
+//    against third-party Canadian business directories to confirm authenticity.
+// 4. Stage 2 (AI Fallback): Escalates to Gemini, OpenAI, Claude, or custom LLMs
+//    only if OSINT confidence is below user-configured threshold, grounding the
+//    model strictly on scraped evidence.
+// 5. Contact Scoring & Storage: Ranks executive addresses above generic company
+//    inboxes, computes confidence (0-5), and records provenance metadata.
+// ============================================================================
 import { buildReferences, collectiveScore, scoreLabel } from "./domain-authority";
 import { cleanCompanyName } from "./req";
 import { guardRow, sharedDomainAllowed } from "./domain-guard";

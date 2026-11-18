@@ -1,3 +1,12 @@
+// ============================================================================
+// RECYC OSINT - BATCH QUEUE & JOB MANAGEMENT SERVER FUNCTIONS
+// ============================================================================
+// Server functions (TanStack Start `createServerFn`):
+// - `pumpJob`: Client-side reactive pump that drives row enrichment while dashboard is open.
+// - `probeWorker`: Connection tester for external Google Colab / VPS OSINT workers.
+// - `claim_job_rows`: Interacts with PostgreSQL queue RPC to lease rows with heartbeat tracking.
+// - `exportContacts`: Formats and streams enriched contacts to CSV/JSON/XLSX.
+// ============================================================================
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { collectiveScore, scoreLabel } from "./domain-authority";
 import { createServerFn } from "@tanstack/react-start";
