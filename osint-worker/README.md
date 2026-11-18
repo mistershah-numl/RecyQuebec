@@ -56,7 +56,7 @@ The ngrok URL changes each restart — repaste it when you restart ngrok.
 
 For production, install the same folder on a Windows or Linux VPS, run the command above as a
 managed service, expose port 8000 through HTTPS, and paste that stable HTTPS URL in API Settings.
-The website host can be Lovable, Hostinger, or another provider; it only needs outbound HTTPS access
+The website host can be Vercel, Hostinger, VPS, or another provider; it only needs outbound HTTPS access
 to the worker. Do not use `localhost` in the website settings.
 
 If a request is stuck, open `/health`. Increasing `failed` means sites are timing out safely; it does

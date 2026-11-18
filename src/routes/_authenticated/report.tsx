@@ -217,7 +217,7 @@ function ReportPage() {
             </>,
             <>
               <b>AI on evidence only</b> — the model receives the collected corpus and is asked to extract and attribute,
-              not to recall. Lovable-hosted Gemini is the default; operator-supplied Perplexity or other keys are used
+              not to recall. Gemini is the default; operator-supplied Perplexity or other keys are used
               when present.
             </>,
             <>

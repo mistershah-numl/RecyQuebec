@@ -339,7 +339,7 @@ function SettingsPage() {
             <CardTitle className="text-base">Provider keys</CardTitle>
             <CardDescription>
               Stored securely and never shown again after saving. Leave blank to keep the existing key.
-              With no key configured, enrichment falls back to the built-in Lovable AI models.
+              With no key configured, enrichment falls back to the default Gemini AI models.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">

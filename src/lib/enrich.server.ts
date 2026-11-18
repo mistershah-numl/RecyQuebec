@@ -118,11 +118,11 @@ function resolveProvider(model: string, keys: Record<string, string | null>): Pr
       model: model.replace("google/", ""),
     };
   }
-  const lovableKey = process.env["LOVABLE_API_KEY"];
-  if (!lovableKey) throw new Error("No AI key configured.");
+  const fallbackKey = process.env["AI_GATEWAY_KEY"] || process.env["GEMINI_API_KEY"] || process.env["OPENAI_API_KEY"];
+  if (!fallbackKey) throw new Error("No AI key configured. Please configure your Gemini, OpenAI, or custom LLM key in Settings.");
   return {
-    url: "https://ai.gateway.lovable.dev/v1/chat/completions",
-    headers: { "Lovable-API-Key": lovableKey, "content-type": "application/json" },
+    url: process.env["AI_GATEWAY_URL"] || "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    headers: { authorization: `Bearer ${fallbackKey}`, "content-type": "application/json" },
     model,
   };
 }
@@ -1594,15 +1594,13 @@ export async function processDueJobs(db: AnySupabase, maxJobs = 3) {
 async function mapListings(name: string, city: string | null, postal: string | null): Promise<string[]> {
   const q = [name, city, postal, "Québec, Canada"].filter(Boolean).join(", ");
   const out: string[] = [];
-  const lk = process.env["LOVABLE_API_KEY"];
   const gk = process.env["GOOGLE_MAPS_API_KEY"];
-  if (lk && gk) {
+  if (gk) {
     try {
-      const r = await fetch("https://connector-gateway.lovable.dev/google_maps/places/v1/places:searchText", {
+      const r = await fetch("https://places.googleapis.com/v1/places:searchText", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${lk}`,
-          "X-Connection-Api-Key": gk,
+          "X-Goog-Api-Key": gk,
           "Content-Type": "application/json",
           "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri",
         },

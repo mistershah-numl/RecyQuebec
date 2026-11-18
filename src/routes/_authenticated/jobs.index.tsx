@@ -520,7 +520,7 @@ function JobsPage() {
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                Built-in Lovable AI models are always available. Models needing your own key appear
+                Built-in models are always available. Models needing your own key appear
                 here once you save that key in API Settings.
               </p>
             </div>

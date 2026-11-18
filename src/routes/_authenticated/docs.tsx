@@ -100,7 +100,7 @@ function DocsPage() {
             </li>
             <li>
               <span className="text-foreground">Model settings</span> — bring your own Gemini / OpenAI / Perplexity /
-              Anthropic keys; the model dropdown only lists models you actually have a key for, and Lovable AI (Gemini)
+              Anthropic keys; the model dropdown only lists models you actually have a key for, and Gemini AI
               is the default so nothing breaks before you add keys.
             </li>
             <li>
@@ -190,8 +190,8 @@ function DocsPage() {
               <p>
                 Only if OSINT came back thin does the LLM run, and it runs{" "}
                 <span className="text-foreground">on the collected evidence</span> (snippets, crawled text, registry
-                text) rather than from memory — it extracts and structures, it does not invent. Default is Lovable AI
-                (Gemini); if you save your own Gemini / OpenAI / Perplexity / Anthropic key in API Settings, that
+                text) rather than from memory — it extracts and structures, it does not invent. Default is Gemini AI;
+                if you save your own Gemini / OpenAI / Perplexity / Anthropic key in API Settings, that
                 provider is used instead. Anything the model returns is then pushed back through verification.
               </p>
             </Step>
@@ -347,7 +347,7 @@ if (worker) {
           <ol className="list-decimal space-y-2 pl-5">
             <li>
               <span className="text-foreground">API Settings</span> — optionally paste your Gemini / OpenAI / Perplexity
-              keys. Skip this and Lovable AI (Gemini) is used.
+              keys. Skip this and default Gemini models are used.
             </li>
             <li>
               <span className="text-foreground">Batch Jobs → New batch</span> — drop your REQ CSV/XLSX, confirm the

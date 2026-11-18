@@ -12,10 +12,9 @@ SELECT cron.schedule(
   '* * * * *',
   $cron$
   SELECT net.http_post(
-    url := 'https://recycosint.lovable.app/api/public/hooks/process-batch',
+    url := coalesce(current_setting('app.settings.app_url', true), 'http://localhost:8080') || '/api/public/hooks/process-batch',
     headers := jsonb_build_object(
-      'content-type', 'application/json',
-      'apikey', 'sb_publishable_Hs5S-qoHtD557y8zs89SOA_8kCT7xA-'
+      'content-type', 'application/json'
     ),
     body := '{}'::jsonb,
     timeout_milliseconds := 180000

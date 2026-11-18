@@ -237,15 +237,15 @@ export function sourceHeaders(records: Record<string, unknown>[]): string[] {
 export type ModelOption = {
   value: string;
   label: string;
-  /** Which stored key unlocks it; null = built-in Lovable AI (always available). */
+  /** Which stored key unlocks it; null = built-in AI. */
   requiresKey: "gemini_key" | "openai_key" | "perplexity_key" | "anthropic_key" | "custom_ai_key" | null;
 };
 
 export const MODEL_OPTIONS: ModelOption[] = [
-  { value: "google/gemini-3.1-flash-lite", label: "Lovable AI — Gemini Flash Lite (fastest / cheapest)", requiresKey: null },
-  { value: "google/gemini-3.6-flash", label: "Lovable AI — Gemini Flash (balanced, default)", requiresKey: null },
-  { value: "google/gemini-2.5-pro", label: "Lovable AI — Gemini Pro (deepest reasoning)", requiresKey: null },
-  { value: "openai/gpt-5.6-luna", label: "Lovable AI — GPT-5.6 Luna (fast)", requiresKey: null },
+  { value: "google/gemini-3.1-flash-lite", label: "Gemini Flash Lite (fastest / cheapest)", requiresKey: null },
+  { value: "google/gemini-3.6-flash", label: "Gemini Flash (balanced, default)", requiresKey: null },
+  { value: "google/gemini-2.5-pro", label: "Gemini Pro (deepest reasoning)", requiresKey: null },
+  { value: "openai/gpt-4o-mini", label: "GPT-4o mini (fast)", requiresKey: null },
   { value: "gemini/gemini-flash-latest", label: "Your Gemini key — Gemini Flash (latest)", requiresKey: "gemini_key" },
   { value: "gemini/gemini-pro-latest", label: "Your Gemini key — Gemini Pro (latest)", requiresKey: "gemini_key" },
   { value: "gemini/gemini-3.6-flash", label: "Your Gemini key — Gemini 3.6 Flash", requiresKey: "gemini_key" },

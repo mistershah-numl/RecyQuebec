@@ -1,29 +1,68 @@
-# Welcome to your Lovable project
+# RECYC Contact OSINT
 
-This project was built with [Lovable](https://lovable.dev).
+An advanced B2B Open-Source Intelligence (OSINT) and executive contact enrichment platform specifically tailored for Quebec (Canada) enterprises.
 
-## Build with Lovable
+## Key Features
 
-Open your project in the [Lovable editor](https://lovable.dev) and keep building.
+- **Automated Enterprise Discovery**: Integrates Donnees Québec open data (REQ) and multi-engine live search to identify registered companies, trade names, official domains, and business addresses.
+- **Executive Contact Extraction**: Mines management and team pages for high-level executives (Présidents, Directeurs Généraux, CEOs, Owners, Founders, Partners) using French and English corporate title heuristics.
+- **Smart Email Synthesis & Verification**:
+  - Automatically synthesizes executive permutations (`first.last@domain`, `flast@domain`, `first@domain`).
+  - RFC compliance checks, disposable domain filtering, and live DNS MX resolution.
+  - Deep SMTP handshake verification and reverse correlation analysis.
+- **AI-Powered Fallback**: Multi-provider support for Google Gemini, OpenAI, Anthropic Claude, and custom OpenAI-compatible endpoints to extract structured data from unstructured corporate websites.
+- **Batch Processing & Queue Management**: Distributed job queue with lease-based claiming, heartbeats, and automatic stale job recovery.
+- **Integrated Outreach & CRM**: Curated lead database, personalized email templating, dry-run simulations, and direct SMTP dispatching.
 
-- **Ship faster**: describe what you want to build and Lovable handles the code.
-- **Stay in sync**: connect the project to GitHub and every change made in Lovable is committed straight to your repository.
-- **Full ownership**: this code is yours. Push to your repository and your changes sync back into Lovable, ready for your next prompt.
+## Tech Stack
 
-## Development
+- **Framework**: TanStack Start (SSR), React 19, TanStack Router
+- **Styling**: Tailwind CSS, Radix UI primitives, Lucide Icons
+- **Database & Auth**: Supabase PostgreSQL with Row Level Security (RLS)
+- **Deployment**: Vercel / Node.js
 
-Prefer working locally? You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating).
+## Getting Started
 
-```sh
-git clone <this-repository-url>
-cd <repository-name>
-npm i
+### Prerequisites
+
+- Node.js >= 20.x
+- npm >= 10.x
+
+### Installation
+
+```bash
+git clone https://github.com/mistershah-numl/RecyQuebec.git
+cd RecyQuebec
+npm install
+```
+
+### Environment Configuration
+
+Copy `.env.example` to `.env` and fill in your Supabase credentials:
+
+```bash
+cp .env.example .env
+```
+
+### Development
+
+```bash
 npm run dev
 ```
 
-## Built with
+The application will start at `http://localhost:8080/`.
 
-- TanStack Start
-- TypeScript
-- React
-- Tailwind CSS
+### Production Build
+
+```bash
+npm run build
+```
+
+## Deployment
+
+### Vercel Deployment
+
+1. Import this repository into Vercel.
+2. In Project Settings, set `NITRO_PRESET=vercel`.
+3. Add the environment variables listed in `.env.example`.
+4. Deploy.
