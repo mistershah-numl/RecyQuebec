@@ -1,7 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { Pause, Play, Square } from "lucide-react";
+import {
+  AlertTriangle,
+  Building2,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  ExternalLink,
+  FileCode,
+  Globe,
+  Mail,
+  Pause,
+  Phone,
+  Play,
+  ShieldCheck,
+  Square,
+  UserCheck,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -10,6 +26,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { getEvidenceRubric } from "@/lib/domain-authority";
 import { getJob, pumpJob, setJobStatus, startJob } from "@/lib/jobs.functions";
 import { formatEta } from "@/lib/req";
 
@@ -45,6 +62,7 @@ function JobDetail() {
   const job: any = data?.job;
   const logs: any[] = data?.logs ?? [];
   const activeRows: any[] = data?.activeRows ?? [];
+  const contacts: any[] = data?.contacts ?? [];
   const running = job?.status === "running";
   const [now, setNow] = useState(() => Date.now());
 
@@ -185,51 +203,238 @@ function JobDetail() {
 
       <Card className="mt-6">
         <CardHeader>
-          <CardTitle className="text-base">Per-record activity</CardTitle>
+          <CardTitle className="text-base">Per-record activity &amp; Extracted Evidence</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-3">
+        <CardContent className="space-y-4">
           {records.length === 0 ? (
             <p className="text-sm text-muted-foreground">No records processed yet.</p>
           ) : (
-            records.map((rec) => (
-              <details key={rec.key} open={rec === records[0]} className="rounded-lg border border-border p-3">
-                <summary className="flex cursor-pointer items-center justify-between gap-2 text-sm font-medium">
-                  <span className="min-w-0 truncate">{rec.key}</span>
-                  <Badge
-                    variant={
-                      rec.outcome === "success"
-                        ? "default"
-                        : rec.outcome === "error"
-                          ? "destructive"
-                          : "secondary"
-                    }
-                  >
-                    {rec.outcome === "running" ? "searching…" : rec.summary}
-                  </Badge>
-                </summary>
-                <ol className="mt-3 space-y-1 border-l border-border pl-4 font-mono text-xs">
-                  {rec.steps.map((s) => (
-                    <li
-                      key={s.id}
-                      className={
-                        s.level === "error"
-                          ? "text-destructive"
-                          : s.level === "warn"
-                            ? "text-amber-600 dark:text-amber-400"
-                            : s.level === "success"
-                              ? "text-emerald-600 dark:text-emerald-400"
-                              : "text-muted-foreground"
-                      }
-                    >
-                      <span className="opacity-60">
-                        {new Date(s.created_at).toLocaleTimeString()}
-                      </span>{" "}
-                      {s.text}
-                    </li>
-                  ))}
-                </ol>
-              </details>
-            ))
+            records.map((rec) => {
+              const compClean = rec.key.replace(/^\[\d+\]\s*/, "").trim().toLowerCase();
+              const contact = contacts.find((c: any) => {
+                if (!c?.company_name) return false;
+                const cn = c.company_name.toLowerCase();
+                return compClean === cn || compClean.includes(cn) || cn.includes(compClean);
+              });
+
+              const score = contact
+                ? Number(contact.confidence ?? 0)
+                : (/score (\d)\/5/.test(rec.summary)
+                  ? parseInt(rec.summary.match(/score (\d)\/5/)![1]!)
+                  : (rec.outcome === "success" ? 4 : 0));
+              const rubric = getEvidenceRubric(score);
+
+              // Gather extracted proof sources from contact details and step logs
+              const rawSources: Array<{ url: string; selector: string; points: string[]; htmlPreview: string }> = [];
+              const seenUrls = new Set<string>();
+
+              if (contact?.verification_details?.extracted_sources) {
+                for (const src of contact.verification_details.extracted_sources) {
+                  if (src?.url && !seenUrls.has(src.url)) {
+                    seenUrls.add(src.url);
+                    rawSources.push({
+                      url: src.url,
+                      selector: src.selector || "Web Source",
+                      points: src.extraction_points || [],
+                      htmlPreview: src.html_preview || "",
+                    });
+                  }
+                }
+              }
+
+              for (const s of rec.steps) {
+                const text = String(s.text || "");
+                if (text.includes("[RAW SOURCE]") || text.includes("[RAW EXECUTION]")) {
+                  const urlMatch = text.match(/(https?:\/\/[^\s|]+)/);
+                  const url = urlMatch ? urlMatch[1] : "";
+                  const typeMatch = text.match(/Type:\s*([^|]+)/);
+                  const type = typeMatch ? typeMatch[1].trim() : "Extraction Source";
+                  const ptsMatch = text.match(/Points:\s*([^|(]+)/);
+                  const points = ptsMatch ? ptsMatch[1].trim().split(", ") : [];
+                  const htmlMatch = text.match(/\(HTML:\s*([\s\S]*?)\)$/);
+                  if (url && !seenUrls.has(url)) {
+                    seenUrls.add(url);
+                    rawSources.push({
+                      url,
+                      selector: type,
+                      points,
+                      htmlPreview: htmlMatch ? htmlMatch[1] : "",
+                    });
+                  }
+                }
+              }
+
+              const scoreBadgeClass =
+                score >= 5
+                  ? "bg-emerald-600 text-white hover:bg-emerald-700"
+                  : score === 4
+                    ? "bg-blue-600 text-white hover:bg-blue-700"
+                    : score === 3
+                      ? "bg-indigo-600 text-white hover:bg-indigo-700"
+                      : score === 2
+                        ? "bg-amber-600 text-white hover:bg-amber-700"
+                        : score === 1
+                          ? "bg-zinc-600 text-white hover:bg-zinc-700"
+                          : "bg-zinc-800 text-zinc-300";
+
+              return (
+                <details
+                  key={rec.key}
+                  open={rec === records[0]}
+                  className="group rounded-lg border border-border bg-card/60 p-4 transition-all"
+                >
+                  <summary className="flex cursor-pointer items-center justify-between gap-3 text-sm font-medium select-none">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <ChevronRight className="h-4 w-4 shrink-0 transition-transform group-open:rotate-90 text-muted-foreground" />
+                      <span className="font-semibold truncate">{rec.key}</span>
+                      <span className="text-xs text-muted-foreground hidden sm:inline">
+                        {contact?.email ? `· ${contact.email}` : ""}
+                      </span>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <Badge className={`text-[11px] font-mono px-2 py-0.5 ${scoreBadgeClass}`}>
+                        Score {score}/5 · {rubric.label}
+                      </Badge>
+                      <Badge
+                        variant={
+                          rec.outcome === "success"
+                            ? "default"
+                            : rec.outcome === "error"
+                              ? "destructive"
+                              : "secondary"
+                        }
+                      >
+                        {rec.outcome === "running" ? "searching…" : rec.summary}
+                      </Badge>
+                    </div>
+                  </summary>
+
+                  <div className="mt-4 space-y-4 border-t border-border pt-4">
+                    {/* Discovered Contact Card & Rubric Criteria */}
+                    <div className="rounded-md border border-border/80 bg-muted/40 p-3 text-xs space-y-2">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2">
+                        <div>
+                          <span className="text-muted-foreground block text-[10px] uppercase tracking-wider font-semibold">Executive</span>
+                          <span className="font-medium text-foreground">
+                            {contact?.executive_name || "—"} {contact?.title ? `(${contact.title})` : ""}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground block text-[10px] uppercase tracking-wider font-semibold">Email</span>
+                          <span className="font-mono font-medium text-emerald-600 dark:text-emerald-400">
+                            {contact?.email || "No email discovered"}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground block text-[10px] uppercase tracking-wider font-semibold">Phone</span>
+                          <span className="font-mono text-foreground">{contact?.phone || "—"}</span>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground block text-[10px] uppercase tracking-wider font-semibold">Domain</span>
+                          {contact?.domain ? (
+                            <a
+                              href={`https://${contact.domain}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 font-mono text-primary hover:underline"
+                            >
+                              {contact.domain} <ExternalLink className="h-3 w-3" />
+                            </a>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="mt-2 border-t border-border/60 pt-2 flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-[11px]">
+                        <div>
+                          <span className="font-semibold text-muted-foreground">Evidence Criteria: </span>
+                          <span className="text-foreground">{rubric.criteria}</span>
+                        </div>
+                        <div className="shrink-0">
+                          <span className="font-semibold text-muted-foreground">Action: </span>
+                          <span className="font-medium text-primary">{rubric.action}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Extracted Evidence & Proof (HTML / Live Pages) */}
+                    {rawSources.length > 0 && (
+                      <div className="space-y-2 rounded-md border border-emerald-500/30 bg-emerald-950/10 p-3">
+                        <div className="flex items-center gap-2 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+                          <FileCode className="h-4 w-4" />
+                          <span>Extracted Proof &amp; Live Sources ({rawSources.length})</span>
+                        </div>
+                        <div className="space-y-2.5">
+                          {rawSources.map((src, idx) => (
+                            <div key={idx} className="rounded border border-border/80 bg-background/80 p-2.5 text-xs">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <a
+                                  href={src.url.startsWith("http") ? src.url : undefined}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 font-mono font-medium text-primary hover:underline truncate max-w-md"
+                                >
+                                  {src.url} <ExternalLink className="h-3 w-3 shrink-0" />
+                                </a>
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <Badge variant="outline" className="text-[10px] uppercase font-mono">
+                                    {src.selector}
+                                  </Badge>
+                                  {src.points.map((pt, pIdx) => (
+                                    <Badge key={pIdx} variant="secondary" className="text-[10px] font-mono">
+                                      {pt}
+                                    </Badge>
+                                  ))}
+                                </div>
+                              </div>
+                              {src.htmlPreview && (
+                                <details className="mt-2 text-xs">
+                                  <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground hover:text-foreground">
+                                    Show extracted HTML / Text preview
+                                  </summary>
+                                  <pre className="mt-1.5 max-h-36 overflow-y-auto rounded bg-zinc-950 p-2 text-[11px] font-mono leading-relaxed text-zinc-300 border border-zinc-800 whitespace-pre-wrap break-all">
+                                    {src.htmlPreview}
+                                  </pre>
+                                </details>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Step-by-step Audit Logs */}
+                    <details className="text-xs">
+                      <summary className="cursor-pointer text-muted-foreground hover:text-foreground font-medium">
+                        View step-by-step audit logs ({rec.steps.length} entries)
+                      </summary>
+                      <ol className="mt-2 space-y-1 border-l border-border pl-4 font-mono text-[11px]">
+                        {rec.steps.map((s: any) => (
+                          <li
+                            key={s.id}
+                            className={
+                              s.level === "error"
+                                ? "text-destructive"
+                                : s.level === "warn"
+                                  ? "text-amber-600 dark:text-amber-400"
+                                  : s.level === "success"
+                                    ? "text-emerald-600 dark:text-emerald-400"
+                                    : "text-muted-foreground"
+                            }
+                          >
+                            <span className="opacity-60">
+                              {new Date(s.created_at).toLocaleTimeString()}
+                            </span>{" "}
+                            {s.text}
+                          </li>
+                        ))}
+                      </ol>
+                    </details>
+                  </div>
+                </details>
+              );
+            })
           )}
         </CardContent>
       </Card>

@@ -14,7 +14,7 @@
 // 5. Contact Scoring & Storage: Ranks executive addresses above generic company
 //    inboxes, computes confidence (0-5), and records provenance metadata.
 // ============================================================================
-import { buildReferences, collectiveScore, scoreLabel } from "./domain-authority";
+import { buildReferences, collectiveScore, getEvidenceRubric, scoreLabel } from "./domain-authority";
 import { cleanCompanyName } from "./req";
 import {
   guardRow,
@@ -472,31 +472,51 @@ export async function assessEmail(email: string, ctx: AssessContext, signal?: Ab
         ? "personal"
         : "unknown";
 
-  // Scoring — evidence, not just DNS.
-  let score = 1; // MX only
-  if (spf || hasDmarc) score += 0.5;
-  if (onCompanyDomain) score += 1.5;
-  if (companyMatch) score += 1.5; // Direct company brand match
-  if (nameMatch) score += 1.5; // Direct executive name match
-  if (isEdu && onCompanyDomain) score += 1;
-  if (mentions >= 1) score += 1;
-  if (mentions >= 2) score += 0.5;
-  if (ctx.origin === "pattern" && mentions === 0) score -= 1; // guessed, never seen published
-  if (ctx.origin === "ai" && mentions === 0) score -= 1.5; // model output with no public trace
-  if (freemail && !nameMatch && !companyMatch && mentions === 0) score -= 1;
-  const confidence = Math.max(0, Math.min(5, Math.round(score)));
+  // Scoring — strictly grounded in the User's Evidence Criteria Rubric (0 to 5):
+  // 5: Executive name, title, telephone number, and email address are corroborated across at least two independent public sources.
+  // 4: A named decision-maker is identified, and the associated email address is published on the company’s website or an official registry.
+  // 3: Executive name and corporate domain are identified, and a candidate email passes the passive MX check but lacks public confirmation.
+  // 2: Only a generic role-based email address is identified, without a verified link to an executive.
+  // 1: Domain resolves, but no corroborated email address, telephone number, or executive record is identified.
+  // 0: Domain unresolved, DNS check fails, or no usable web presence is identified.
+  const hasExecutive = Boolean(
+    nameMatch || (ctx.personName && ctx.personName.trim().length >= 3) || ctx.origin === "pattern",
+  );
 
+  let confidence: number;
   let status: EmailAssessment["status"];
-  if (mentions >= 1 && (onCompanyDomain || companyMatch || nameMatch || isEdu || mentions >= 2)) {
-    status = "Verified";
-    reasons.push("Cross-checked: deliverable and publicly attributed to this company/person");
-  } else if (mentions >= 1 || onCompanyDomain || companyMatch || isEdu) {
-    status = "MX Verified";
-    reasons.push("Deliverable and seen publicly, but not attributed to a named person");
+
+  if (hasExecutive) {
+    if (mentions >= 2 && (nameMatch || mentions >= 2)) {
+      confidence = 5;
+      status = "Verified";
+      reasons.push(
+        "Executive name, title/role, and email corroborated across at least 2 independent public sources (Eligible for outreach review)",
+      );
+    } else if (mentions >= 1 || onCompanyDomain || companyMatch) {
+      confidence = 4;
+      status = "Verified";
+      reasons.push(
+        "Named decision-maker identified with published email on company website or registry (Eligible for outreach review)",
+      );
+    } else {
+      confidence = 3;
+      status = "MX Verified";
+      reasons.push(
+        "Executive name and corporate domain identified with valid MX, but lacks public confirmation (Internal hypothesis)",
+      );
+    }
   } else {
-    status = "Unverified";
-    reasons.push("Deliverable domain, but the exact mailbox was never seen published — treat as a guess");
+    confidence = 2;
+    status = mentions >= 1 ? "MX Verified" : "Unverified";
+    reasons.push(
+      "Only a generic role-based email address is identified, without a verified link to an executive (Secondary institutional contact)",
+    );
   }
+
+  const rubric = getEvidenceRubric(confidence);
+  signals["evidence_criteria"] = rubric.criteria;
+  signals["evidence_action"] = rubric.action;
 
   return { status, confidence, email_type, signals, reasons };
 }
@@ -867,6 +887,7 @@ export async function enrichCompany(
     references,
     source_score: sourceScore,
     source_score_label: scoreLabel(sourceScore),
+    extracted_sources: evidence.rawExecutionSources?.slice(0, 10),
   };
   if (references.length) {
     await onStep(

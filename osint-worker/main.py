@@ -100,6 +100,10 @@ CANADA_RE = re.compile(
     r"\b(canada|canadian|qu[ée]bec|quebec|montr[ée]al|montreal|ottawa|toronto|vancouver|calgary|"
     r"edmonton|winnipeg|halifax|saskatoon|regina|new brunswick|nova scotia|ontario|alberta|"
     r"british columbia|manitoba|saskatchewan|pei|newfoundland|yukon|nunavut|northwest territories|"
+    r"laval|gatineau|longueuil|sherbrooke|saguenay|l[ée]vis|trois-rivi[èe]res|terrebonne|saint-jean-sur-richelieu|"
+    r"brossard|repentigny|saint-j[ée]r[ôo]me|drummondville|granby|saint-hyacinthe|beloeil|joliette|victoriaville|"
+    r"rimouski|chibougamau|rouyn-noranda|val-d'or|salaberry-de-valleyfield|shawinigan|"
+    r"514|438|450|579|418|581|367|819|873|"
     r"[A-Z]\d[A-Z][ -]?\d[A-Z]\d)\b",
     re.IGNORECASE,
 )
@@ -521,21 +525,38 @@ def generate_candidate_permutations(exec_name: str, domain: str) -> List[str]:
     ]
 
 
-async def search(engine_url: str, link_filter=None) -> List[str]:
-    page = await fetch_text(engine_url, allow_browser=False)
-    soup = BeautifulSoup(page["html"], "html.parser")
+def _extract_search_links(html: str, link_filter=None) -> List[str]:
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
     links: List[str] = []
     for a in soup.select("a[href]"):
         href = a["href"]
         if "//duckduckgo.com/l/?uddg=" in href:
             full = "https:" + href if href.startswith("//") else href
             href = unquote(parse_qs(urlparse(full).query).get("uddg", [""])[0])
+        elif "/r.search.yahoo.com/" in href or "/RU=" in href:
+            m = re.search(r"/RU=([^/]+)/", href)
+            if m:
+                href = unquote(m.group(1))
         if not href.startswith("http"):
+            continue
+        if any(h in href for h in BAD_HOSTS):
             continue
         if link_filter and not link_filter(href):
             continue
         if href not in links:
             links.append(href)
+    return links[:25]
+
+
+async def search(engine_url: str, link_filter=None, allow_browser: bool = True) -> List[str]:
+    page = await fetch_text(engine_url, allow_browser=False)
+    links = _extract_search_links(page.get("html", ""), link_filter)
+    if not links and allow_browser:
+        # Browser fallback with Playwright
+        page = await fetch_text(engine_url, wait_ms=1200, allow_browser=True)
+        links = _extract_search_links(page.get("html", ""), link_filter)
     return links[:25]
 
 
@@ -719,11 +740,21 @@ async def _osint_impl(body: OsintIn):
     # 1. Official Domain Discovery
     if not domain:
         log.append(f"Searching official domain for '{clean_name}'")
-        urls = await search(
+        search_candidates = [
             f"https://duckduckgo.com/html/?q={quote_plus(q_base + ' site officiel OR official website')}",
-            lambda h: not any(s in h for s in (*BAD_HOSTS, "facebook.com", "linkedin.com", "yellowpages.ca")),
-        )
-        for u in urls[:5]:
+            f"https://ca.search.yahoo.com/search?p={quote_plus(clean_name + ' ' + city_str + ' Quebec contact courriel')}",
+            f"https://ca.search.yahoo.com/search?p={quote_plus(clean_name + ' site officiel')}",
+        ]
+        urls = []
+        for s_url in search_candidates:
+            urls = await search(
+                s_url,
+                lambda h: not any(s in h for s in (*BAD_HOSTS, "facebook.com", "linkedin.com", "yellowpages.ca")),
+                allow_browser=True,
+            )
+            if urls:
+                break
+        for u in urls[:6]:
             host = urlparse(u).netloc.lower().replace("www.", "")
             candidate_page = await osint_fetch(u, wait_ms=500)
             candidate_html = candidate_page["html"]
@@ -738,6 +769,37 @@ async def _osint_impl(body: OsintIn):
                     "domain discovery page"
                 )
                 break
+
+    # 1b. Canadian Business Registry Lookup (Numbered entities & SMBs)
+    is_numbered = bool(re.search(r"\b\d{4}[ -]?\d{4}\b|\b\d{6,8}\b", clean_name))
+    if not domain or is_numbered:
+        if is_numbered:
+            log.append(f"Numbered corporation detected: querying Canadian business registry records for '{clean_name}'")
+        reg_queries = [
+            f"https://ca.search.yahoo.com/search?p={quote_plus(clean_name + ' Quebec registre entreprises OR can1business OR opengovca')}",
+            f"https://duckduckgo.com/html/?q={quote_plus(clean_name + ' Quebec registre entreprises')}",
+        ]
+        for rq in reg_queries:
+            r_urls = await search(
+                rq,
+                lambda h: any(k in h for k in ("can1business.com", "opengovca.com", "b2bhint.com", "quebecentreprises.com", "companies-canada.ca", "registre")),
+                allow_browser=True,
+            )
+            for ru in r_urls[:3]:
+                cand = await osint_fetch(ru, wait_ms=600)
+                cand_html = cand["html"]
+                cand_text = clean_html_to_markdown(cand_html)
+                if cand_text and (clean_name.lower() in cand_text.lower() or (body.neq and body.neq in cand_text)):
+                    add_raw_source(ru, cand_html, ["registry_record", "trade_name_dba", "administrators"], "registry mirror")
+                    emails += clean_emails(EMAIL_RE.findall(cand_html))
+                    phones += [norm_phone(m) for m in PHONE_RE.finditer(cand_text)]
+                    people += extract_people_from_markdown(cand_text)
+                    if not address:
+                        addr_m = re.search(r"\b\d+[\w\s,.-]+(?:Québec|Quebec|Montréal|Montreal|Laval|QC)[\w\s,.-]+[A-Z]\d[A-Z]\s*\d[A-Z]\d\b", cand_text)
+                        if addr_m:
+                            address = addr_m.group(0).strip()
+                    log.append(f"Registry match: {urlparse(ru).netloc}")
+                    break
 
     # 2. SpiderFoot & theHarvester Recon Pass
     if domain:

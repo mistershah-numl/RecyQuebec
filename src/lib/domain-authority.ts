@@ -134,3 +134,55 @@ export function buildReferences(
   }
   return out.sort((a, b) => b.score - a.score);
 }
+
+export type EvidenceRubricItem = {
+  score: number;
+  criteria: string;
+  action: string;
+  label: string;
+};
+
+export const EVIDENCE_RUBRIC: Record<number, EvidenceRubricItem> = {
+  0: {
+    score: 0,
+    criteria: "Domain unresolved, DNS check fails, or no usable web presence is identified.",
+    action: "Record purged from the active discovery pool.",
+    label: "Domain Unresolved",
+  },
+  1: {
+    score: 1,
+    criteria: "Domain resolves, but no corroborated email address, telephone number, or executive record is identified.",
+    action: "Record logged without contact information.",
+    label: "Domain Only / No Contact",
+  },
+  2: {
+    score: 2,
+    criteria: "Only a generic role-based email address is identified, without a verified link to an executive.",
+    action: "Flagged as a secondary institutional contact option.",
+    label: "Generic Role Account",
+  },
+  3: {
+    score: 3,
+    criteria: "Executive name and corporate domain are identified, and a candidate email passes the passive MX check but lacks public confirmation.",
+    action: "Retained as an internal hypothesis and excluded from the proposed outreach list.",
+    label: "Candidate Executive (Unconfirmed)",
+  },
+  4: {
+    score: 4,
+    criteria: "A named decision-maker is identified, and the associated email address is published on the company’s website or an official registry.",
+    action: "Eligible for further outreach review.",
+    label: "Published Decision-Maker",
+  },
+  5: {
+    score: 5,
+    criteria: "The executive’s name, title, telephone number, and email address are corroborated across at least two independent public sources.",
+    action: "Eligible for further outreach review.",
+    label: "Corroborated Executive (Multi-Source)",
+  },
+};
+
+export function getEvidenceRubric(score: number): EvidenceRubricItem {
+  const s = Math.max(0, Math.min(5, Math.round(score)));
+  return EVIDENCE_RUBRIC[s] ?? EVIDENCE_RUBRIC[0]!;
+}
+

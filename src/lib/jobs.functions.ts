@@ -406,7 +406,19 @@ export const getJob = createServerFn({ method: "POST" })
       .eq("status", "processing")
       .order("row_index", { ascending: true })
       .limit(8);
-    return { job, logs: (logs ?? []).reverse(), activeRows: activeRows ?? [] };
+    const { data: contacts } = await context.supabase
+      .from("contacts")
+      .select("id, company_name, neq, executive_name, title, email, phone, domain, verification_status, confidence, source, verification_details, registry_url, linkedin_url, created_at")
+      .eq("job_id", data.job_id)
+      .eq("user_id", context.userId)
+      .order("created_at", { ascending: false })
+      .limit(300);
+    return {
+      job,
+      logs: (logs ?? []).reverse(),
+      activeRows: activeRows ?? [],
+      contacts: contacts ?? [],
+    };
   });
 
 /** Client-side pump: processes one bounded batch while the dashboard is open. */
