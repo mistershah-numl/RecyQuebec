@@ -37,6 +37,10 @@ __pycache__/
 .pw-profile/
 */.pw-profile/
 
+# User uploads and data files
+*.xlsx
+*.csv
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

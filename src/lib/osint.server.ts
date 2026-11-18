@@ -318,6 +318,40 @@ export function setWorkerConfig(cfg: { url?: string | null; secret?: string | nu
   runtimeWorker = { url: cfg.url?.trim() || null, secret: cfg.secret?.trim() || null };
 }
 
+export function decodeCloudflareEmail(cfHex: string): string {
+  try {
+    const k = parseInt(cfHex.slice(0, 2), 16);
+    let out = "";
+    for (let i = 2; i < cfHex.length; i += 2) {
+      out += String.fromCharCode(parseInt(cfHex.slice(i, i + 2), 16) ^ k);
+    }
+    return out;
+  } catch {
+    return "";
+  }
+}
+
+export function unmaskCloudflareEmails(html: string): string {
+  if (!html || (!html.includes("email-protection") && !html.includes("data-cfemail"))) {
+    return html;
+  }
+  let res = html.replace(
+    /href=["'](?:(?:\/cdn-cgi\/l\/email-protection#|#))([a-fA-F0-9]{4,})["']/gi,
+    (_, hex) => {
+      const decoded = decodeCloudflareEmail(hex);
+      return decoded ? `href="mailto:${decoded}"` : _;
+    },
+  );
+  res = res.replace(
+    /data-cfemail=["']([a-fA-F0-9]{4,})["'][^>]*>(?:\[email&#160;protected\]|\[email protected\])?</gi,
+    (_, hex) => {
+      const decoded = decodeCloudflareEmail(hex);
+      return decoded ? `>${decoded}<` : _;
+    },
+  );
+  return res;
+}
+
 async function workerFetch(url: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<string | null> {
   const base = runtimeWorker.url ?? process.env["OSINT_WORKER_URL"];
   const secret = runtimeWorker.secret ?? process.env["OSINT_WORKER_SECRET"];
@@ -343,7 +377,7 @@ async function workerFetch(url: string, timeoutMs: number, parentSignal?: AbortS
     if (!res.ok) return null;
     const data = (await res.json()) as { html?: string; text?: string };
     const body = data.html ?? data.text ?? null;
-    return body ? body.slice(0, 400_000) : null;
+    return body ? unmaskCloudflareEmails(body.slice(0, 400_000)) : null;
   } catch {
     return null;
   }
@@ -475,7 +509,7 @@ async function safeFetch(url: string, timeoutMs = 8000, parentSignal?: AbortSign
     const type = res.headers.get("content-type") ?? "";
     if (type && !/(html|text|xml|json)/i.test(type)) return null;
     const text = (await res.text()).slice(0, 400_000);
-    if (text.length >= 600 && !/just a moment|cf-challenge|challenge-platform/i.test(text)) return text;
+    if (text.length >= 600 && !/just a moment|cf-challenge|challenge-platform/i.test(text)) return unmaskCloudflareEmails(text);
   } catch {
     // Browser fallback below.
   }
@@ -730,24 +764,56 @@ function collectPhones(text: string): string[] {
   ).slice(0, 4);
 }
 
+const NON_NAME_WORDS = new Set([
+  "united", "states", "america", "americas", "china", "canada", "quebec", "montreal", "france",
+  "paris", "europe", "asia", "pacific", "kingdom", "africa", "japan", "australia", "germany",
+  "ireland", "scotland", "netherlands", "hong", "kong", "chancellor", "president", "director",
+  "partner", "lead", "officer", "manager", "operations", "senior", "global", "regional", "country",
+  "national", "appointed", "search", "about", "contact", "read", "view", "show", "refine", "explore",
+  "useful", "terms", "policy", "privacy", "cookies", "legal", "copyright", "rights", "reserved",
+  "open", "roles", "case", "studies", "insights", "services", "expertise", "people", "team",
+  "executive", "board", "chair", "trust", "group", "holdings", "associates", "consultants",
+  "as", "pro", "or", "for", "and", "the", "our", "dr", "mr", "mrs", "ms", "prof", "mme",
+]);
+
+export function cleanPersonName(raw: string): string {
+  return raw
+    .replace(/^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s+/i, "")
+    .replace(/\s+(?:vice|pr[ée]sident(e)?|directeur|directrice|president|ceo|owner|fondateur|associ[ée]|g[ée]rant(e)?|chief|partner|director)$/i, "")
+    .trim();
+}
+
+export function isValidPersonName(name: string): boolean {
+  if (!name || name.length < 3 || name.length > 40) return false;
+  const clean = cleanPersonName(name);
+  const parts = clean.split(/\s+/);
+  if (parts.length < 2 || parts.length > 4) return false;
+  if (parts.some((p) => NON_NAME_WORDS.has(p.toLowerCase()))) {
+    return false;
+  }
+  for (const p of parts) {
+    if (!/^[A-ZÀ-Ý][a-zà-ÿ'’-]+$/.test(p)) return false;
+  }
+  return true;
+}
+
 /** Heuristic executive extraction: "Jean Tremblay, Président" / "Président : Jean Tremblay". */
 function collectPeople(text: string): { name: string; title: string }[] {
   const out: { name: string; title: string }[] = [];
-  const NAME = "([A-ZÀ-Ý][\\p{L}'’-]+(?:\\s+[A-ZÀ-Ý][\\p{L}'’-]+){1,2})";
+  const NAME = "([A-ZÀ-Ý][a-zà-ÿ'’-]+(?:[ \\t]+[A-ZÀ-Ý][a-zà-ÿ'’-]+){1,2})";
   const patterns = [
-    new RegExp(`${NAME}\\s*[,–—-]\\s*(${TITLE_WORDS})`, "giu"),
-    new RegExp(`(${TITLE_WORDS})\\s*[:,–—-]\\s*${NAME}`, "giu"),
+    new RegExp(`${NAME}[ \\t]*[,–—-]\\s*((?i:${TITLE_WORDS}))`, "gu"),
+    new RegExp(`((?i:${TITLE_WORDS}))\\s*[:,–—-][ \\t]*${NAME}`, "gu"),
   ];
   for (const [i, re] of patterns.entries()) {
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) && out.length < 20) {
-      const name = (i === 0 ? m[1] : m[2])
-        ?.trim()
-        .replace(/\s+(vice|pr[ée]sident(e)?|directeur|directrice|president|ceo|owner|fondateur|associ[ée]|g[ée]rant(e)?|chief)$/i, "")
-        .trim();
+    while ((m = re.exec(text)) && out.length < 25) {
+      const rawName = (i === 0 ? m[1] : m[2])?.trim();
       const title = (i === 0 ? m[2] : m[1])?.trim();
-      if (name && title && !out.some((p) => p.name.toLowerCase() === name.toLowerCase())) {
-        out.push({ name, title });
+      if (!rawName || !title) continue;
+      const cleanName = cleanPersonName(rawName);
+      if (isValidPersonName(cleanName) && !out.some((p) => p.name.toLowerCase() === cleanName.toLowerCase())) {
+        out.push({ name: cleanName, title });
       }
     }
   }

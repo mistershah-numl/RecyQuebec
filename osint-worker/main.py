@@ -414,7 +414,7 @@ async def _render_impl(body: RenderIn):
                     pass
 
             await page.wait_for_timeout(body.wait_ms)
-            html = await page.content()
+            html = unmask_cloudflare_emails(await page.content())
             text = clean_html_to_markdown(html)
             app.state.stats["completed"] += 1
             return {"ok": True, "status": status, "url": page.url, "html": html, "text": text}
@@ -436,12 +436,37 @@ async def _render_impl(body: RenderIn):
             app.state.stats["active"] = max(0, app.state.stats["active"] - 1)
 
 
+def decode_cloudflare_email(cf_hex: str) -> str:
+    try:
+        k = int(cf_hex[:2], 16)
+        return "".join([chr(int(cf_hex[i:i+2], 16) ^ k) for i in range(2, len(cf_hex), 2)])
+    except Exception:
+        return ""
+
+
+def unmask_cloudflare_emails(html: str) -> str:
+    if not html or ("email-protection" not in html and "data-cfemail" not in html):
+        return html
+    html = re.sub(
+        r'href=["\'](?:/cdn-cgi/l/email-protection#|#)([a-fA-F0-9]{4,})["\']',
+        lambda m: f'href="mailto:{decode_cloudflare_email(m.group(1))}"' if decode_cloudflare_email(m.group(1)) else m.group(0),
+        html,
+    )
+    html = re.sub(
+        r'data-cfemail=["\']([a-fA-F0-9]{4,})["\'][^>]*>(?:\[email&#160;protected\]|\[email protected\])?<',
+        lambda m: f'>{decode_cloudflare_email(m.group(1))}<' if decode_cloudflare_email(m.group(1)) else m.group(0),
+        html,
+    )
+    return html
+
+
 # ---------------------------------------------------------------- Advanced OSINT & Clean Markdown Modules
 def clean_html_to_markdown(raw_html: str) -> str:
     """Strips noisy layout tags, scripts, and attributes, returning clean structured Markdown."""
     if not raw_html:
         return ""
     try:
+        raw_html = unmask_cloudflare_emails(raw_html)
         soup = BeautifulSoup(raw_html, "html.parser")
 
         # 1. Decompose non-semantic and structural noise tags
@@ -472,13 +497,13 @@ async def fetch_text(url: str, wait_ms: int = 900, allow_browser: bool = True) -
         ) as client:
             r = await client.get(url)
             if r.status_code < 400 and len(r.text) > 800 and "Just a moment" not in r.text:
-                return {"html": r.text, "url": str(r.url)}
+                return {"html": unmask_cloudflare_emails(r.text), "url": str(r.url)}
     except Exception:
         pass
     if not allow_browser:
         return {"html": "", "url": url}
     out = await render(RenderIn(url=url, wait_ms=wait_ms), x_worker_secret=WORKER_SECRET or None)
-    return {"html": out.get("html", ""), "url": out.get("url", url)}
+    return {"html": unmask_cloudflare_emails(out.get("html", "")), "url": out.get("url", url)}
 
 
 def deaccent(s: str) -> str:
@@ -500,12 +525,104 @@ def norm_phone(m) -> str:
     return f"({m.group(1)}) {m.group(2)}-{m.group(3)}"
 
 
+NON_NAME_WORDS = {
+    "united", "states", "america", "americas", "china", "canada", "quebec", "montreal", "france",
+    "paris", "europe", "asia", "pacific", "kingdom", "africa", "japan", "australia", "germany",
+    "ireland", "scotland", "netherlands", "hong", "kong", "chancellor", "president", "director",
+    "partner", "lead", "officer", "manager", "operations", "senior", "global", "regional", "country",
+    "national", "appointed", "search", "about", "contact", "read", "view", "show", "refine", "explore",
+    "useful", "terms", "policy", "privacy", "cookies", "legal", "copyright", "rights", "reserved",
+    "open", "roles", "case", "studies", "insights", "services", "expertise", "people", "team",
+    "executive", "board", "chair", "trust", "group", "holdings", "associates", "consultants",
+    "as", "pro", "or", "for", "and", "the", "our",
+}
+
+
+def clean_person_name(raw: str) -> str:
+    name = re.sub(r"^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s+", "", raw, flags=re.I).strip()
+    name = re.sub(
+        r"\s+(?:vice|président|directeur|directrice|president|ceo|owner|fondateur|associé|gérant|chief|partner|director)$",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    ).strip()
+    return name
+
+
+def is_valid_person_name(name: str) -> bool:
+    if not name or len(name) < 3 or len(name) > 40:
+        return False
+    clean = clean_person_name(name)
+    parts = clean.split()
+    if len(parts) < 2 or len(parts) > 4:
+        return False
+    if any(p.lower() in NON_NAME_WORDS for p in parts):
+        return False
+    for p in parts:
+        if not re.match(r"^[A-ZÀ-Ý][a-zà-ÿ'\-]+$", p):
+            return False
+    return True
+
+
+def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
+    if not html:
+        return []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        results = []
+        seen = set()
+
+        selectors = [
+            ".people__item", ".team__item", ".team-member", ".team-card", ".person-card",
+            ".profile-card", "[class*='people__item']", "[class*='team-member']",
+            "[class*='person__card']", "[class*='member-card']"
+        ]
+        card_nodes = soup.select(", ".join(selectors))
+        for card in card_nodes:
+            text = card.get_text("\n", strip=True)
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            if not lines:
+                continue
+            cand_name = clean_person_name(lines[0])
+            if not is_valid_person_name(cand_name):
+                continue
+            norm = cand_name.lower()
+            if norm in seen:
+                continue
+            seen.add(norm)
+
+            title = lines[1] if len(lines) > 1 and len(lines[1]) < 60 else "Executive"
+            
+            email = None
+            mail_a = card.select_one('a[href^="mailto:"]')
+            if mail_a:
+                raw_href = mail_a.get("href", "")
+                cleaned = raw_href.replace("mailto:", "").split("?")[0].strip().lower()
+                if "@" in cleaned and "." in cleaned:
+                    email = cleaned
+
+            phone = None
+            tel_a = card.select_one('a[href^="tel:"]')
+            if tel_a:
+                phone = tel_a.get("href", "").replace("tel:", "").strip()
+
+            results.append({
+                "name": cand_name,
+                "title": title,
+                "email": email,
+                "phone": phone
+            })
+        return results
+    except Exception:
+        return []
+
+
 def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
     if not text:
         return []
     results = []
     seen = set()
-    name_pat = r"([A-ZÀ-Ý][a-zà-ÿ'\-]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ'\-]+){1,2})"
+    name_pat = r"([A-ZÀ-Ý][a-zà-ÿ'\-]+(?:[ \t]+[A-ZÀ-Ý][a-zà-ÿ'\-]+){1,2})"
     title_words = (
         r"(?:Président(?:e)?(?:[- ]Directeur[- ]Général)?|Vice[- ]Président(?:e)?|"
         r"Directeur(?:trice)?(?:\s+Général(?:e)?|\s+d'[ée]tudes|\s+des\s+[ée]tudes)?|"
@@ -516,21 +633,20 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
         r"General Manager|Managing Director|Partner|Executive Director|Director|VP|Vice[- ]President)"
     )
     pats = [
-        re.compile(rf"{name_pat}\s*[,–—\-]\s*({title_words})", re.IGNORECASE),
-        re.compile(rf"({title_words})\s*[:,–—\-]\s*{name_pat}", re.IGNORECASE),
+        re.compile(rf"{name_pat}[ \t]*[,–—\-][ \t]*((?i:{title_words}))"),
+        re.compile(rf"((?i:{title_words}))[ \t]*[:,–—\-][ \t]*{name_pat}"),
     ]
     for idx, pat in enumerate(pats):
         for m in pat.finditer(text):
             raw_name = m.group(1 if idx == 0 else 2).strip()
             raw_title = m.group(2 if idx == 0 else 1).strip()
-            name = re.sub(
-                r"\s+(?:vice|président|directeur|directrice|president|ceo|owner|fondateur|associé|gérant|chief)$",
-                "", raw_name, flags=re.IGNORECASE
-            ).strip()
-            clean_norm = name.lower()
-            if len(name) >= 3 and clean_norm not in seen and len(results) < 25:
+            clean_name = clean_person_name(raw_name)
+            if not is_valid_person_name(clean_name):
+                continue
+            clean_norm = clean_name.lower()
+            if clean_norm not in seen and len(results) < 25:
                 seen.add(clean_norm)
-                results.append({"name": name, "title": raw_title})
+                results.append({"name": clean_name, "title": raw_title})
     return results
 
 
@@ -619,6 +735,7 @@ def generate_candidate_permutations(exec_name: str, domain: str) -> List[str]:
     first, last = parts[0], parts[-1]
     return [
         f"{first}.{last}@{domain}",
+        f"{first[0]}.{last}@{domain}",
         f"{first[0]}{last}@{domain}",
         f"{first}@{domain}",
         f"{last}@{domain}",
@@ -874,7 +991,7 @@ async def _osint_impl(body: OsintIn):
         for u in urls[:6]:
             host = urlparse(u).netloc.lower().replace("www.", "")
             candidate_page = await osint_fetch(u, wait_ms=500)
-            candidate_html = candidate_page["html"]
+            candidate_html = unmask_cloudflare_emails(candidate_page["html"])
             candidate_text = clean_html_to_markdown(candidate_html)
 
             # --- DIRECTORY TRAP: If this is a directory portal, do NOT adopt its
@@ -948,7 +1065,7 @@ async def _osint_impl(body: OsintIn):
             )
             for ru in r_urls[:3]:
                 cand = await osint_fetch(ru, wait_ms=600)
-                cand_html = cand["html"]
+                cand_html = unmask_cloudflare_emails(cand["html"])
                 cand_text = clean_html_to_markdown(cand_html)
                 if cand_text and (clean_name.lower() in cand_text.lower() or (body.neq and body.neq in cand_text)):
                     add_raw_source(ru, cand_html, ["registry_record", "trade_name_dba", "administrators"], "registry mirror")
@@ -974,7 +1091,7 @@ async def _osint_impl(body: OsintIn):
         )
         for au in addr_urls[:4]:
             cand = await osint_fetch(au, wait_ms=600)
-            cand_html = cand["html"]
+            cand_html = unmask_cloudflare_emails(cand["html"])
             cand_text = clean_html_to_markdown(cand_html)
             host = urlparse(au).netloc.lower().replace("www.", "")
             if host and "." in host and not any(b in host for b in BAD_HOSTS) and not is_directory_host(host):
@@ -1060,25 +1177,41 @@ async def _osint_impl(body: OsintIn):
                 continue
             seen.add(p)
             r = await osint_fetch(p)
-            page_html = r["html"]
+            page_html = unmask_cloudflare_emails(r["html"])
 
             # Clean page into structured Markdown
             markdown_content = clean_html_to_markdown(page_html)
 
             # Log raw extraction source with HTML preview
             extraction_summary = []
-            emails_found = EMAIL_RE.findall(page_html)
+            emails_found = clean_emails(EMAIL_RE.findall(page_html))
             if emails_found:
                 extraction_summary.append("email_regex")
             phones_found = [norm_phone(m) for m in PHONE_RE.finditer(markdown_content)]
             if phones_found:
                 extraction_summary.append("phone_regex")
 
+            # Extract structured person cards directly from DOM
+            dom_people = extract_people_from_dom(page_html)
+            if dom_people:
+                extraction_summary.append("dom_people_cards")
+                for dp in dom_people:
+                    clean_dp = dp["name"].lower()
+                    if not any(x["name"].lower() == clean_dp for x in people):
+                        people.append(dp)
+                    if dp.get("email"):
+                        emails.append(dp["email"])
+                    if dp.get("phone"):
+                        phones.append(dp["phone"])
+
             # Extract named executives with French & English leadership patterns
             extracted_people = extract_people_from_markdown(markdown_content)
             if extracted_people:
                 extraction_summary.append("exec_people_pattern")
-                people += extracted_people
+                for ep in extracted_people:
+                    clean_ep = ep["name"].lower()
+                    if not any(x["name"].lower() == clean_ep for x in people):
+                        people.append(ep)
 
             emails += emails_found
             phones += phones_found
@@ -1108,12 +1241,19 @@ async def _osint_impl(body: OsintIn):
             log.append(f"Crawled {p} (Found {len(emails)} emails so far)")
 
     # 4. Executive Pattern Candidate Permutations
+    # Generate unique pattern-based emails for executives who don't have personal emails
     if domain and people:
-        for p_entry in people[:3]:
+        seen_emails_for_pattern = set(emails)  # Track emails already found
+        for p_entry in people[:6]:  # Limit to top 6 executives
             candidates = generate_candidate_permutations(p_entry["name"], domain)
-            emails += candidates
-            if candidates:
-                log.append(f"Permutator: Generated candidates for {p_entry['name']}")
+            # Filter to unused patterns
+            unused_patterns = [c for c in candidates if c not in seen_emails_for_pattern]
+            if unused_patterns:
+                emails.append(unused_patterns[0])
+                seen_emails_for_pattern.add(unused_patterns[0])
+                p_entry["email"] = unused_patterns[0]
+                if candidates:
+                    log.append(f"Permutator: Generated unique email for {p_entry['name']}")
 
     # 5. Directories & Social Profile Discovery
     for site, key in [

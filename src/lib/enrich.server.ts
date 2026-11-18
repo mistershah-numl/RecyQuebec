@@ -16,7 +16,7 @@
 // ============================================================================
 import { buildReferences, collectiveScore, getEvidenceRubric, scoreLabel } from "./domain-authority";
 import { addressFromSourceRow, activityFromSourceRow, tradeNamesFromSourceRow, cleanCompanyName } from "./req";
-import { emailPatterns } from "./osint.server";
+import { emailPatterns, cleanPersonName, isValidPersonName } from "./osint.server";
 import {
   guardRow,
   sharedDomainAllowed,
@@ -707,6 +707,28 @@ function looksPersonal(email: string, people: { name: string }[]): boolean {
   return /^[a-z]{2,}[._-][a-z]{2,}$/.test(local);
 }
 
+/** Strictly checks whether an email address actually matches a specific person's name. */
+function emailMatchesPerson(email: string, person: { name: string }): boolean {
+  const local = (email.split("@")[0] ?? "").toLowerCase();
+  if (!local || ROLE_LOCAL.test(local.replace(/[._-].*$/, ""))) return false;
+  const bare = local.replace(/[^a-z]/g, "");
+  const parts = person.name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .split(/\s+/)
+    .map((x) => x.replace(/[^a-z]/g, ""))
+    .filter((x) => x.length >= 2);
+  if (parts.length === 0) return false;
+  const lastName = parts[parts.length - 1]!;
+  if (lastName.length >= 3 && bare.includes(lastName)) return true;
+  const firstName = parts[0]!;
+  if (bare === `${firstName}${lastName}` || bare === `${firstName[0]}${lastName}` || bare === `${lastName}${firstName[0]}`) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Higher tier = closer to a confirmed executive or verified company mailbox.
  * Executive-first hierarchy:
@@ -771,53 +793,81 @@ function candidateTier(
 }
 
 function buildAdditionalExecutives(
-  people: { name: string; title: string }[],
+  people: { name: string; title: string; email?: string | null; phone?: string | null }[],
   primaryName: string | null,
+  primaryEmail: string | null,
   assessedEmails: { email: string; status: any; confidence: number }[],
   domain: string | null,
-  phone: string | null,
+  companyPhone: string | null,
 ): AdditionalExecutive[] {
+  // Track names and emails to avoid duplicates within this company
   const seenNames = new Set<string>();
-  if (primaryName) seenNames.add(primaryName.trim().toLowerCase());
+  const seenEmails = new Set<string>();
+
+  if (primaryName) seenNames.add(cleanPersonName(primaryName).toLowerCase());
+  if (primaryEmail) seenEmails.add(primaryEmail.toLowerCase());
 
   const result: AdditionalExecutive[] = [];
 
   for (const person of people) {
     if (!person.name || person.name.trim().length < 2) continue;
-    const norm = person.name.trim().toLowerCase();
+    const cleanName = cleanPersonName(person.name);
+    if (!isValidPersonName(cleanName)) continue;
+    const norm = cleanName.toLowerCase();
     if (seenNames.has(norm)) continue;
     seenNames.add(norm);
 
-    // Check if any assessed email looks personal to this person
-    const matchedAssessed = assessedEmails.find(
-      (a) => a.email && looksPersonal(a.email, [person]) && a.status !== "Invalid",
-    );
+    let email: string | null = null;
+    let status: AdditionalExecutive["status"] = "Unverified";
+    let confidence: number = 1;
 
-    let email: string | null = matchedAssessed?.email ?? null;
-    let status: AdditionalExecutive["status"] = matchedAssessed?.status ?? "Unverified";
-    let confidence: number = matchedAssessed?.confidence ?? 1;
+    // 1. Direct email from person card (e.g. from DOM card extraction)
+    if (person.email && !seenEmails.has(person.email.toLowerCase())) {
+      email = person.email.toLowerCase();
+      status = "Verified";
+      confidence = 4;
+    }
 
-    // If no email directly matched, see if we can derive a first.last@domain pattern if domain has MX
-    if (!email && domain) {
-      const pats = emailPatterns(person.name, domain);
-      const matchedPat = pats.find((p) =>
-        assessedEmails.some((a) => a.email.toLowerCase() === p.toLowerCase() && a.status !== "Invalid"),
+    // 2. Check assessed emails that specifically match this person's name
+    if (!email) {
+      const matchedAssessed = assessedEmails.find(
+        (a) =>
+          a.email &&
+          emailMatchesPerson(a.email, { name: cleanName }) &&
+          a.status !== "Invalid" &&
+          !seenEmails.has(a.email.toLowerCase()),
       );
-      if (matchedPat) {
-        email = matchedPat;
+      if (matchedAssessed) {
+        email = matchedAssessed.email.toLowerCase();
+        status = matchedAssessed.status;
+        confidence = matchedAssessed.confidence;
+      }
+    }
+
+    // 3. Pattern candidate generation if domain exists and has MX
+    if (!email && domain) {
+      const pats = emailPatterns(cleanName, domain);
+      const unusedPat = pats.find((p) => !seenEmails.has(p.toLowerCase()));
+      if (unusedPat) {
+        email = unusedPat.toLowerCase();
         status = "MX Verified";
         confidence = 3;
       }
     }
 
-    result.push({
-      name: person.name.trim(),
-      title: person.title?.trim() || "Executive",
-      email,
-      phone,
-      confidence,
-      status,
-    });
+    // Only add this executive if they have a unique email (personal or pattern-generated)
+    // Never replicate the same email or company phone across multiple contacts
+    if (email && !seenEmails.has(email.toLowerCase())) {
+      seenEmails.add(email.toLowerCase());
+      result.push({
+        name: cleanName,
+        title: person.title?.trim() || "Executive",
+        email,
+        phone: person.phone ?? null,
+        confidence,
+        status,
+      });
+    }
   }
 
   return result;
@@ -1174,6 +1224,7 @@ export async function enrichCompany(
     const additional_executives = buildAdditionalExecutives(
       evidence.people,
       chosenPerson?.name ?? null,
+      best!.cand.email,
       assessedEmails,
       targets.domain === false ? null : (evidence.domain ?? best!.cand.email.split("@")[1]!),
       phone,
@@ -1212,10 +1263,12 @@ export async function enrichCompany(
     const mx = evidence.domain ? await hasMx(evidence.domain, signal) : false;
     const chosenPerson =
       (best ? evidence.people.find((p) => looksPersonal(best.cand.email, [p])) : null) ?? person;
+    const primaryEmail = best?.cand.email ?? null;
 
     const additional_executives = buildAdditionalExecutives(
       evidence.people,
       chosenPerson?.name ?? null,
+      primaryEmail,
       assessedEmails,
       targets.domain === false ? null : evidence.domain,
       phone,
@@ -1224,7 +1277,7 @@ export async function enrichCompany(
     return {
       executive_name: chosenPerson?.name ?? null,
       title: chosenPerson?.title ?? null,
-      email: best?.cand.email ?? null,
+      email: primaryEmail,
       phone,
       domain: targets.domain === false ? null : evidence.domain,
       verification_status: best ? best.assessment.status : "Unverified",
@@ -1433,9 +1486,11 @@ Likely own-domain shapes: ${guessBases.join(", ")} (with .ca / .com / .qc.ca).`;
   );
 
   const primaryExecutive = aiText("executive_name") ?? person?.name ?? null;
+  const primaryExecutiveEmail = verification === "Invalid" ? null : email;
   const additional_executives = buildAdditionalExecutives(
     evidence.people,
     primaryExecutive,
+    primaryExecutiveEmail,
     assessedEmails,
     targets.domain === false ? null : domain,
     phone ?? (targets.phone === false ? null : (siteFound?.phones[0] ?? aiText("phone"))),
@@ -1447,7 +1502,7 @@ Likely own-domain shapes: ${guessBases.join(", ")} (with .ca / .com / .qc.ca).`;
       targets.address === false ? null : (evidence.address ?? siteFound?.address ?? aiText("address")),
     executive_name: primaryExecutive,
     title: aiText("title") ?? person?.title ?? null,
-    email: verification === "Invalid" ? null : email,
+    email: primaryExecutiveEmail,
     phone: phone ?? (targets.phone === false ? null : (siteFound?.phones[0] ?? aiText("phone"))),
     domain: targets.domain === false ? null : domain,
     verification_status: verification,
@@ -1770,11 +1825,70 @@ export async function processJobBatch(
         });
 
         // Store separate rows for any additional leadership executives discovered
+        // Only when they have unique contact info (not just replications of the primary)
         if (result.additional_executives && result.additional_executives.length > 0) {
           let extraSaved = 0;
+          const seenEmailsForThisCompany = new Set<string>();
+          // Track emails already stored for this company in this batch
+          if (result.email) seenEmailsForThisCompany.add(result.email.toLowerCase());
+          if (result.additional_executives) {
+            for (const existing of result.additional_executives) {
+              if (existing.email) seenEmailsForThisCompany.add(existing.email.toLowerCase());
+            }
+          }
+
           for (const exec of result.additional_executives.slice(0, 10)) {
             if (!exec.name) continue;
             if (exec.name.trim().toLowerCase() === (result.executive_name ?? "").trim().toLowerCase()) continue;
+
+            // Skip if this executive has an email that's already used by another contact in this company
+            if (exec.email && seenEmailsForThisCompany.has(exec.email.toLowerCase())) {
+              await step(
+                `Skipping ${exec.name} - email ${exec.email} already assigned to another contact at ${row.company_name}`,
+                "info",
+              );
+              continue;
+            }
+
+            // Skip duplicate email across rows - same guard check as primary
+            if (exec.email) {
+              const { data: dupe } = await db
+                .from("contacts")
+                .select("company_name, email")
+                .eq("user_id", job.user_id)
+                .eq("email", exec.email)
+                .neq("company_name", row.company_name)
+                .limit(1);
+              const other = dupe?.[0];
+              if (other) {
+                await step(
+                  `Skipping ${exec.name} - email ${exec.email} already exists for "${other.company_name}" (cross-company duplicate)`,
+                  "info",
+                );
+                continue;
+              }
+            }
+
+            // Skip duplicate phone across rows
+            if (exec.phone) {
+              const { data: dupePhone } = await db
+                .from("contacts")
+                .select("company_name, phone")
+                .eq("user_id", job.user_id)
+                .eq("phone", exec.phone)
+                .neq("company_name", row.company_name)
+                .limit(1);
+              const otherPhone = dupePhone?.[0];
+              if (otherPhone) {
+                await step(
+                  `Skipping ${exec.name} - phone ${exec.phone} already exists for "${otherPhone.company_name}" (cross-company duplicate)`,
+                  "info",
+                );
+                continue;
+              }
+            }
+
+            if (exec.email) seenEmailsForThisCompany.add(exec.email.toLowerCase());
 
             await db.from("contacts").insert({
               user_id: job.user_id,
