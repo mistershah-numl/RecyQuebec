@@ -1105,12 +1105,17 @@ export async function enrichCompany(
   const person = evidence.people[0] ?? null;
   if (person) await onStep(`Executive candidate: ${person.name}${person.title ? ` — ${person.title}` : ""}`);
   const corpus = [...evidence.snippets, ...evidence.emails];
+  const DUMMY_EMAIL_PATTERNS = /^(?:name|user|email|yourname|sample|test|dummy|username|someone|first\.last|firstname\.lastname|john\.doe|johndoe|nom|prenom|utilisateur|courriel)@/i;
+  const DUMMY_DOMAINS = /^(?:example\.(?:com|ca)|exemple\.(?:com|ca)|domaine\.(?:com|ca)|domain\.(?:com|ca)|placeholder\.com|test\.com|securityeye\.com|security\.com)$/i;
+
   // Drop platform/support/marketplace mailboxes (amazon.com, lightinthebox.com, wixpress.com…)
-  // that leak in from ads, widgets, cookie banners, or hosting boilerplate.
+  // and template dummy placeholders (nom@exemple.com, support@securityeye.com…)
   const scrapedEmails = evidence.emails.filter((e) => {
+    if (DUMMY_EMAIL_PATTERNS.test(e)) return false;
     const at = e.split("@");
+    if (at.length !== 2) return false;
     const d = cleanDomain(at[1]) || (at[1]?.toLowerCase() ?? "");
-    if (!d) return false;
+    if (!d || DUMMY_DOMAINS.test(d)) return false;
     if (isVendorDomain(d)) return false;
     if (!isFreeMailDomain(d) && isBlockedSite(d)) return false;
     return true;

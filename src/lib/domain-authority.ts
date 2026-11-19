@@ -181,8 +181,16 @@ export const EVIDENCE_RUBRIC: Record<number, EvidenceRubricItem> = {
   },
 };
 
-export function getEvidenceRubric(score: number): EvidenceRubricItem {
+export function getEvidenceRubric(score: number, hasPhoneOrAddress?: boolean): EvidenceRubricItem {
   const s = Math.max(0, Math.min(5, Math.round(score)));
+  if (s === 0 && hasPhoneOrAddress) {
+    return {
+      score: 1,
+      criteria: "No verified email discovered, but verified telephone and/or civic location corroborated.",
+      action: "Eligible for telephone outreach or manual review.",
+      label: "Phone / Location Verified",
+    };
+  }
   return EVIDENCE_RUBRIC[s] ?? EVIDENCE_RUBRIC[0]!;
 }
 

@@ -528,14 +528,20 @@ export async function workerOsint(input: {
     const d = (await res.json()) as Partial<WorkerOsintResult> & { ok?: boolean; trusted_emails?: string[] };
     if (d.ok === false) return null;
     const str = (v: unknown) => (typeof v === "string" ? v : null);
+    const DUMMY_EMAIL_PATTERNS = /^(?:name|user|email|yourname|sample|test|dummy|username|someone|first\.last|firstname\.lastname|john\.doe|johndoe|nom|prenom|utilisateur|courriel)@/i;
+    const DUMMY_DOMAINS = /^(?:example\.(?:com|ca)|exemple\.(?:com|ca)|domaine\.(?:com|ca)|domain\.(?:com|ca)|placeholder\.com|test\.com|securityeye\.com|security\.com)$/i;
+
     const sanitizeEmailList = (list: unknown[]): string[] =>
       list
         .filter((e): e is string => typeof e === "string" && Boolean(e.trim()))
         .map((e) => e.trim().toLowerCase())
         .filter((e) => {
+          if (DUMMY_EMAIL_PATTERNS.test(e)) return false;
           const at = e.split("@");
+          if (at.length !== 2) return false;
           const ed = cleanDomain(at[1]) || at[1]?.trim().toLowerCase();
-          return !ed || isFreeMailDomain(ed) || !isBlockedSite(ed);
+          if (!ed || DUMMY_DOMAINS.test(ed)) return false;
+          return isFreeMailDomain(ed) || !isBlockedSite(ed);
         });
 
     const rawSocials = (d as any).socials ?? {};

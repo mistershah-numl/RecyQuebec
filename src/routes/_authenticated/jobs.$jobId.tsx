@@ -30,6 +30,14 @@ import { getEvidenceRubric } from "@/lib/domain-authority";
 import { getJob, pumpJob, setJobStatus, startJob } from "@/lib/jobs.functions";
 import { formatEta } from "@/lib/req";
 
+function normForMatch(s: string): string {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
 export const Route = createFileRoute("/_authenticated/jobs/$jobId")({
   head: () => ({
     meta: [
@@ -210,12 +218,27 @@ function JobDetail() {
             <p className="text-sm text-muted-foreground">No records processed yet.</p>
           ) : (
             records.map((rec) => {
-              const compClean = rec.key.replace(/^\[\d+\]\s*/, "").trim().toLowerCase();
-              const matchingContacts = contacts.filter((c: any) => {
-                if (!c?.company_name) return false;
-                const cn = c.company_name.toLowerCase();
-                return compClean === cn || compClean.includes(cn) || cn.includes(compClean);
-              });
+              const normKey = rec.key.replace(/^\[\d+\]\s*/, "");
+              const keyNorm = normForMatch(normKey);
+              const matchingContacts = contacts
+                .filter((c: any) => {
+                  if (!c?.company_name) return false;
+                  const cnNorm = normForMatch(c.company_name);
+                  return (
+                    keyNorm === cnNorm ||
+                    keyNorm.includes(cnNorm) ||
+                    cnNorm.includes(keyNorm)
+                  );
+                })
+                .sort((a: any, b: any) => {
+                  const scoreDiff = Number(b.confidence ?? 0) - Number(a.confidence ?? 0);
+                  if (scoreDiff !== 0) return scoreDiff;
+                  if (b.email && !a.email) return 1;
+                  if (a.email && !b.email) return -1;
+                  if (b.phone && !a.phone) return 1;
+                  if (a.phone && !b.phone) return -1;
+                  return 0;
+                });
               const contact = matchingContacts[0] ?? null;
               const additionalContacts = matchingContacts.slice(1);
 
@@ -224,7 +247,8 @@ function JobDetail() {
                 : (/score (\d)\/5/.test(rec.summary)
                   ? parseInt(rec.summary.match(/score (\d)\/5/)![1]!)
                   : (rec.outcome === "success" ? 4 : 0));
-              const rubric = getEvidenceRubric(score);
+              const hasPhoneOrAddress = Boolean(contact?.phone || contact?.address);
+              const rubric = getEvidenceRubric(score, hasPhoneOrAddress);
 
               // Gather extracted proof sources from contact details and step logs
               const rawSources: Array<{ url: string; selector: string; points: string[]; htmlPreview: string }> = [];

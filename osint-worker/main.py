@@ -102,10 +102,10 @@ GENERIC_PREFIXES = (
 )
 
 BAD_EMAIL_HINTS = (
-    "example.com", "example.ca", "sentry.io", "wixpress.com", "godaddy.com", "schema.org",
-    "domain.com", "domain.ca", "email.com", "company.com", "yourcompany.com", "yourdomain.com",
+    "example.com", "example.ca", "exemple.com", "exemple.ca", "sentry.io", "wixpress.com", "godaddy.com", "schema.org",
+    "domain.com", "domain.ca", "domaine.com", "domaine.ca", "email.com", "company.com", "yourcompany.com", "yourdomain.com",
     "placeholder.com", "dummy.com", "test.com", ".png", ".jpg", ".jpeg", ".svg", ".webp", "@2x",
-    "cloudflare.com", "protection", "privacy", "whoisguard",
+    "cloudflare.com", "protection", "privacy", "whoisguard", "securityeye.com", "security.com",
     "lightinthebox.com", "miniinthebox.com", "aliexpress.com", "alibaba.com",
     "temu.com", "shein.com", "wish.com", "dhgate.com", "myshopify.com", "shopify.com",
     "wikipedia.org", "wikimedia.org", "wikidata.org", "wiktionary.org",
@@ -718,15 +718,32 @@ def deaccent(s: str) -> str:
 
 DUMMY_EMAIL_PREFIXES = (
     "name@", "user@", "email@", "yourname@", "sample@", "test@", "dummy@", "username@",
-    "someone@", "first.last@", "firstname.lastname@", "john.doe@", "johndoe@"
+    "someone@", "first.last@", "firstname.lastname@", "john.doe@", "johndoe@",
+    "nom@", "prenom@", "utilisateur@", "courriel@", "votre.nom@", "votrenom@", "client@"
 )
+
+
+def is_valid_email_syntax(e: str) -> bool:
+    if not e or "@" not in e or len(e) > 80:
+        return False
+    local, dom = e.split("@", 1)
+    if len(local) < 2 or len(dom) < 4 or "." not in dom:
+        return False
+    tld = dom.split(".")[-1]
+    if len(tld) < 2 or len(tld) > 10 or not tld.isalpha():
+        return False
+    if len(local) == 1 and len(dom.split(".")[0]) <= 2:
+        return False
+    return True
 
 
 def clean_emails(raw: List[str]) -> List[str]:
     seen, cleaned = set(), []
     for e in raw:
         e = e.strip().strip(".,;:)'\"").lower()
-        if any(b in e for b in BAD_EMAIL_HINTS) or "@" not in e or len(e) > 80 or e in seen:
+        if not is_valid_email_syntax(e):
+            continue
+        if any(b in e for b in BAD_EMAIL_HINTS) or e in seen:
             continue
         if any(e.startswith(p) for p in DUMMY_EMAIL_PREFIXES):
             continue
@@ -848,14 +865,9 @@ def is_institutional_name(name: str) -> bool:
     if not name:
         return False
     n = name.strip().lower()
-    return (
-        n.startswith("direction")
-        or n.startswith("administration")
-        or n.startswith("gouvernance")
-        or n.startswith("secrétariat")
-        or n.startswith("secretariat")
-        or n.startswith("bureau")
-    )
+    if bool(re.search(r"\b\d+.*(?:av\.|avenue|rue|boulevard|boul\.|ch\.|chemin|route|blvd|dr\b|drive)\b", n)):
+        return False
+    return bool(re.match(r"^(?:direction|administration|gouvernance|secr[ée]tariat|bureau)\b(?!\s*\(?directions?\b)", n))
 
 
 def clean_person_name(raw: str) -> str:
@@ -1244,7 +1256,10 @@ async def harvester_passive_discovery(domain: str, company_name: str) -> Tuple[L
     dork_urls = await search(dork_query, lambda h: not any(b in h for b in BAD_HOSTS))
     for url in dork_urls[:3]:
         r = await fetch_text(url, allow_browser=False)
-        discovered_emails += EMAIL_RE.findall(r["html"])
+        for em in EMAIL_RE.findall(r["html"]):
+            em_clean = em.lower().strip()
+            if em_clean.endswith("@" + domain.lower()) or em_clean.endswith("." + domain.lower()):
+                discovered_emails.append(em_clean)
 
     try:
         async with httpx.AsyncClient(timeout=6) as client:
@@ -2312,7 +2327,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
     # web presence, phone, or email, create a structured institutional executive entry so the
     # record is retained as an active contactable company instead of being purged.
     if not people and (domain or phones or emails):
-        inst_email = next((e for e in emails if domain and e.endswith("@" + domain)), None) or (emails[0] if emails else None)
+        inst_email = next((e for e in emails if domain and e.endswith("@" + domain)), None)
         inst_phone = phones[0] if phones else None
         people.append({
             "name": f"Direction - {clean_name}",
