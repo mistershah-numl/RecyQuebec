@@ -436,6 +436,75 @@ async def _render_impl(body: RenderIn):
             app.state.stats["active"] = max(0, app.state.stats["active"] - 1)
 
 
+async def _search_google_maps_impl(query: str) -> Dict[str, Any]:
+    """Fast, lightweight Google Maps place reconnaissance on Chromium."""
+    async with app.state.lock:
+        context = None
+        page = None
+        try:
+            await ensure_browser(app)
+            context = await app.state.browser.new_context(
+                user_agent=UA,
+                locale="fr-CA",
+                timezone_id="America/Toronto",
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={"Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"},
+            )
+            page = await context.new_page()
+            page.set_default_timeout(14000)
+
+            async def _block_media(route):
+                if route.request.resource_type in ("image", "media", "font"):
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route("**/*", _block_media)
+            url = f"https://www.google.com/maps/search/{quote_plus(query)}/"
+            await page.goto(url, wait_until="domcontentloaded", timeout=14000)
+            await page.wait_for_timeout(2000)
+
+            res: Dict[str, Any] = {"address": None, "phone": None, "website": None, "title": None, "html": ""}
+
+            title = (await page.title()) or ""
+            res["title"] = title.replace(" - Google Maps", "").strip()
+
+            # Address element
+            addr_el = page.locator("button[data-item-id*='address'], [aria-label*='Address'], [aria-label*='Adresse']").first
+            if await addr_el.count() > 0:
+                txt = await addr_el.text_content() or await addr_el.get_attribute("aria-label")
+                if txt:
+                    res["address"] = txt.strip().replace("", "").strip()
+
+            # Phone element
+            phone_el = page.locator("button[data-item-id*='phone'], [aria-label*='Phone'], [aria-label*='Téléphone']").first
+            if await phone_el.count() > 0:
+                txt = await phone_el.text_content() or await phone_el.get_attribute("aria-label")
+                if txt:
+                    res["phone"] = txt.strip().replace("", "").strip()
+
+            # Website element
+            web_el = page.locator("a[data-item-id*='authority'], [aria-label*='Website'], [aria-label*='Site Web']").first
+            if await web_el.count() > 0:
+                txt = await web_el.get_attribute("href") or await web_el.text_content()
+                if txt:
+                    res["website"] = txt.strip()
+
+            res["html"] = await page.content()
+            return res
+        except Exception as e:
+            return {"address": None, "phone": None, "website": None, "title": None, "html": "", "error": str(e)}
+        finally:
+            if page:
+                with suppress(Exception):
+                    await page.unroute_all(behavior="wait")
+                with suppress(Exception):
+                    await asyncio.wait_for(page.close(), timeout=5)
+            if context:
+                with suppress(Exception):
+                    await asyncio.wait_for(context.close(), timeout=5)
+
+
 def decode_cloudflare_email(cf_hex: str) -> str:
     try:
         k = int(cf_hex[:2], 16)
@@ -888,13 +957,50 @@ def _extract_search_links(html: str, link_filter=None) -> List[str]:
 
 
 async def search(engine_url: str, link_filter=None, allow_browser: bool = True) -> List[str]:
+    # Extract search query from engine_url if present
+    parsed = urlparse(engine_url)
+    qs = parse_qs(parsed.query)
+    q = qs.get("q", [""])[0] or qs.get("p", [""])[0]
+
+    # 1. First try DuckDuckGo Lite via POST (fastest, unblocked 200ms)
+    if q:
+        try:
+            async with httpx.AsyncClient(
+                timeout=8, follow_redirects=True,
+                headers={"User-Agent": UA, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
+            ) as client:
+                r = await client.post("https://lite.duckduckgo.com/lite/", data={"q": q})
+                if r.status_code == 200:
+                    links = _extract_search_links(r.text, link_filter)
+                    if links:
+                        return links[:25]
+        except Exception:
+            pass
+
+    # 2. Direct HTTP GET
     page = await fetch_text(engine_url, allow_browser=False)
     links = _extract_search_links(page.get("html", ""), link_filter)
+
+    # 3. Browser fallback with Playwright
     if not links and allow_browser:
-        # Browser fallback with Playwright
         page = await fetch_text(engine_url, wait_ms=1200, allow_browser=True)
         links = _extract_search_links(page.get("html", ""), link_filter)
     return links[:25]
+
+
+def activity_matches(page_text: str, activity: Optional[str]) -> bool:
+    """Returns False when page content strongly contradicts the company's registered economic activity."""
+    if not activity or len(activity) < 4:
+        return True
+    stopwords = {"services", "fourniture", "commerce", "autre", "autres", "vente", "activite", "activités", "generale", "générale", "d'autres", "detail", "détail"}
+    act_tokens = [
+        deaccent(t) for t in re.split(r"[^a-zA-ZÀ-ÿ]+", activity.lower())
+        if len(t) >= 4 and deaccent(t) not in stopwords
+    ]
+    if not act_tokens:
+        return True
+    flat_text = deaccent(page_text.lower())
+    return any(tok in flat_text for tok in act_tokens)
 
 
 def company_tokens(name: str) -> List[str]:
@@ -1084,6 +1190,42 @@ async def _osint_impl(body: OsintIn):
     city_str = body.city or ""
     q_base = f'"{search_name}" {city_str} {body.province or ""} {body.country or ""}'.strip()
 
+    # 1a. Google Maps Reconnaissance Pass (Place, Verified Address, Business Phone, Official Website)
+    maps_query = f"{search_name} {city_str} {body.province or 'Quebec'}".strip()
+    try:
+        maps_result = await pw_thread.run_coro(_search_google_maps_impl(maps_query))
+        if maps_result:
+            maps_addr = maps_result.get("address")
+            maps_phone = maps_result.get("phone")
+            maps_web = maps_result.get("website")
+
+            if maps_addr and not address:
+                address = maps_addr
+                log.append(f"Google Maps: Verified civic address -> {address}")
+
+            if maps_phone:
+                parsed_phone = norm_phone(PHONE_RE.search(maps_phone)) if PHONE_RE.search(maps_phone) else maps_phone
+                if parsed_phone and parsed_phone not in phones:
+                    phones.insert(0, parsed_phone)
+                    log.append(f"Google Maps: Verified local phone -> {parsed_phone}")
+
+            if maps_web and not domain:
+                maps_host = urlparse(maps_web).netloc.lower().replace("www.", "")
+                if maps_host and not is_directory_host(maps_host) and name_matches_host(company_name, input_trade_names, maps_host):
+                    domain = maps_host
+                    log.append(f"Google Maps: Discovered official domain -> {domain}")
+
+            if maps_result.get("html"):
+                add_raw_source(
+                    f"https://www.google.com/maps/search/{quote_plus(maps_query)}/",
+                    maps_result["html"][:2000],
+                    ["google_maps_place", "verified_address", "verified_phone"] if maps_addr or maps_phone else ["google_maps_query"],
+                    "google_maps"
+                )
+                socials["maps.google.com"] = f"https://www.google.com/maps/search/{quote_plus(maps_query)}/"
+    except Exception as e:
+        log.append(f"Google Maps recon pass: {e}")
+
     # 1. Official Domain Discovery (with directory-trap protection)
     if not domain:
         log.append(f"Searching official domain for '{search_name}'")
@@ -1111,6 +1253,11 @@ async def _osint_impl(body: OsintIn):
             candidate_page = await osint_fetch(u, wait_ms=500)
             candidate_html = unmask_cloudflare_emails(candidate_page["html"])
             candidate_text = clean_html_to_markdown(candidate_html)
+
+            # Check economic activity match if REQ activity was provided
+            if input_activity and not activity_matches(candidate_text, input_activity):
+                log.append(f"Domain candidate {host} skipped: does not match economic activity '{input_activity}'")
+                continue
 
             # --- DIRECTORY TRAP: If this is a directory portal, do NOT adopt its
             # domain. Instead, extract outbound links that may point to the real
@@ -1421,39 +1568,74 @@ async def _osint_impl(body: OsintIn):
                 if candidates:
                     log.append(f"Permutator: Generated unique email for {p_entry['name']}")
 
-    # 5. Directories & Social Profile Discovery
-    for site, key in [
-        ("linkedin.com/company", "linkedin.com"),
-        ("facebook.com", "facebook.com"),
-        ("b2bhint.com", "b2bhint.com"),
-    ]:
-        if key in socials:
+    # 5. Social Media & Public Profile Deep Mining (Facebook, Instagram, LinkedIn)
+    social_targets = [
+        ("facebook.com", "facebook.com", f'site:facebook.com "{search_name}" {city_str}'),
+        ("instagram.com", "instagram.com", f'site:instagram.com "{search_name}" {city_str}'),
+        ("linkedin.com/company", "linkedin.com", f'site:linkedin.com/company "{search_name}" {city_str}'),
+        ("linkedin.com/in", "linkedin.com/in", f'site:linkedin.com/in "{search_name}" (president OR propriétaire OR directeur OR owner OR ceo OR fondat)'),
+    ]
+    for platform_key, social_key, sq in social_targets:
+        if social_key in socials and social_key != "linkedin.com/in":
             continue
         try:
-            found = await search(
-                f"https://duckduckgo.com/html/?q={quote_plus(f'site:{site} {clean_name} {city_str}'.strip())}",
-                lambda h, s=site.split("/")[0]: s in h,
-            )
+            found = await search(f"https://duckduckgo.com/html/?q={quote_plus(sq.strip())}")
             for candidate_url in found[:3]:
-                candidate = await osint_fetch(candidate_url, wait_ms=500)
-                candidate_html = candidate["html"]
+                host = urlparse(candidate_url).netloc.lower().replace("www.", "")
+                if platform_key.split("/")[0] not in host:
+                    continue
+
+                candidate = await osint_fetch(candidate_url, wait_ms=600)
+                candidate_html = unmask_cloudflare_emails(candidate.get("html", ""))
                 candidate_text = clean_html_to_markdown(candidate_html)
 
                 # Log social profile extraction source
                 add_raw_source(
                     candidate_url, candidate_html,
-                    ["meta_description", "profile_summary", "href_links", "title_tag"],
-                    f"social:{key}"
+                    ["meta_description", "profile_summary", "href_links", "contact_info"],
+                    f"social:{social_key}"
                 )
 
                 if trusted_company_page(candidate_text, candidate_url, company_name, body.neq, domain):
-                    socials[key] = candidate_url
-                    log.append(f"Validated Canadian {key}: {candidate_url}")
+                    if social_key != "linkedin.com/in":
+                        socials[social_key] = candidate_url
+                        log.append(f"Validated Canadian {social_key}: {candidate_url}")
+
+                    # Mine social profile for direct emails
+                    social_emails = clean_emails(EMAIL_RE.findall(candidate_html))
+                    if social_emails:
+                        emails += social_emails
+                        log.append(f"Social {social_key}: Extracted {len(social_emails)} email(s)")
+
+                    # Mine social profile for direct phone numbers
+                    social_phones = [norm_phone(m) for m in PHONE_RE.finditer(candidate_text)]
+                    if social_phones:
+                        phones += social_phones
+                        log.append(f"Social {social_key}: Extracted {len(social_phones)} phone(s)")
+
+                    # If official domain not yet discovered, check outbound links on social page
+                    if not domain:
+                        outbound_social = extract_outbound_company_links(candidate_html, company_name, input_trade_names)
+                        for ob_url in outbound_social:
+                            ob_host = urlparse(ob_url).netloc.lower().replace("www.", "")
+                            if not is_directory_host(ob_host) and name_matches_host(company_name, input_trade_names, ob_host):
+                                domain = ob_host
+                                log.append(f"Domain extracted from social outbound profile: {domain}")
+                                break
+
+                    # If LinkedIn personal profile, extract named executive and title
+                    if "linkedin.com/in" in candidate_url:
+                        lp_people = extract_people_from_markdown(candidate_text)
+                        for lp in lp_people:
+                            if not any(x["name"].lower() == lp["name"].lower() for x in people):
+                                people.append(lp)
+                                log.append(f"LinkedIn Executive identified: {lp['name']} ({lp.get('title')})")
+
                     break
-            if found and key not in socials:
-                log.append(f"{key}: Rejected non-matching search results")
+            if found and social_key not in socials and social_key != "linkedin.com/in":
+                log.append(f"{social_key}: Rejected non-matching search results")
         except Exception as e:
-            log.append(f"{key} search failed: {e}")
+            log.append(f"{social_key} search failed: {e}")
 
     # 6. User Custom Target Sites
     for extra in targets:

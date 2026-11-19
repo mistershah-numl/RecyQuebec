@@ -191,7 +191,13 @@ export type Evidence = {
   people: { name: string; title: string }[];
   snippets: string[];
   pagesScraped: number;
-  socials: { linkedin: string | null; facebook: string | null };
+  socials: {
+    linkedin: string | null;
+    facebook: string | null;
+    instagram?: string | null;
+    google_maps?: string | null;
+    [key: string]: string | null | undefined;
+  };
   patternCandidates: string[];
   trail: string[];
   address: string | null;
@@ -399,6 +405,7 @@ export type WorkerOsintResult = {
   address: string | null;
   linkedin: string | null;
   facebook: string | null;
+  socials?: Record<string, string>;
   texts: string[];
   trail: string[];
   rawExecutionSources?: Array<{
@@ -472,6 +479,16 @@ export async function workerOsint(input: {
           return !ed || isFreeMailDomain(ed) || !isBlockedSite(ed);
         });
 
+    const rawSocials = (d as any).socials ?? {};
+    const socials: Record<string, string> = {};
+    if (rawSocials && typeof rawSocials === "object") {
+      for (const [k, v] of Object.entries(rawSocials)) {
+        if (typeof v === "string" && v.trim()) {
+          socials[k] = v.trim();
+        }
+      }
+    }
+
     return {
       emails: sanitizeEmailList(d.emails ?? []).slice(0, 60),
       trustedEmails: sanitizeEmailList(d.trusted_emails ?? []).slice(0, 20),
@@ -482,8 +499,9 @@ export async function workerOsint(input: {
         .slice(0, 25),
       domain: str(d.domain),
       address: str(d.address),
-      linkedin: str(d.linkedin),
-      facebook: str(d.facebook),
+      linkedin: str(d.linkedin) ?? socials["linkedin.com"] ?? null,
+      facebook: str(d.facebook) ?? socials["facebook.com"] ?? null,
+      socials,
       texts: (d.texts ?? []).filter((t) => typeof t === "string").map((t) => t.slice(0, 12_000)).slice(0, 25),
       trail: (d.trail ?? []).filter((t) => typeof t === "string").slice(0, 25),
       rawExecutionSources: ((d.rawExecutionSources ?? (d as any).raw_execution_sources ?? []) as any[]).slice(0, 20),
@@ -982,21 +1000,29 @@ function isSocialProfileUrl(url: string | null | undefined): url is string {
   if (junk.test(path)) return false;
   if (host === "facebook.com" && /^\/(profile\.php|people|pages|[^/]+)/i.test(path)) return true;
   if (host === "linkedin.com" && /^\/(company|in|school|showcase)\/[^/]+/i.test(path)) return true;
+  if (
+    host === "instagram.com" &&
+    /^\/[a-zA-Z0-9._]+$/i.test(path) &&
+    !/^\/(about|developer|legal|explore|accounts|reels|stories|p|tv)/i.test(path)
+  )
+    return true;
   return false;
 }
 
 async function findSocials(clean: string, city: string | null) {
   const where = city ? ` ${city}` : " Québec";
-  const [li, fb] = await Promise.all([
+  const [li, fb, ig] = await Promise.all([
     webSearch(`"${clean}"${where} site:linkedin.com/company`),
     webSearch(`"${clean}"${where} site:facebook.com`),
+    webSearch(`"${clean}"${where} site:instagram.com`),
   ]);
   const pick = (links: string[], host: string) =>
     links.find((l) => (hostOf(l) ?? "").endsWith(host) && isSocialProfileUrl(l)) ?? null;
   return {
     linkedin: pick(li.links, "linkedin.com"),
     facebook: pick(fb.links, "facebook.com"),
-    snippets: [...li.snippets, ...fb.snippets],
+    instagram: pick(ig.links, "instagram.com"),
+    snippets: [...li.snippets, ...fb.snippets, ...ig.snippets],
   };
 }
 
@@ -1224,6 +1250,9 @@ export async function gatherEvidence(
     `"${company.clean_name}"${where} contact courriel${kw}`,
     `${company.clean_name}${where} site officiel${kw}`,
     `"${company.clean_name}" (président OR propriétaire OR directeur) courriel`,
+    `"${company.clean_name}" ${company.city ?? ""} (maps OR adresse OR contact)`,
+    `"${company.clean_name}" site:facebook.com`,
+    `"${company.clean_name}" site:instagram.com`,
   ];
   if (company.neq) queries.push(`"${company.neq}" ${company.clean_name}`);
   if (company.address) {
@@ -1324,9 +1353,32 @@ export async function gatherEvidence(
     }
   }
 
-  const socials: { linkedin: string | null; facebook: string | null } = {
-    linkedin: links.find((l) => (hostOf(l) ?? "").endsWith("linkedin.com") && isSocialProfileUrl(l)) ?? null,
-    facebook: links.find((l) => (hostOf(l) ?? "").endsWith("facebook.com") && isSocialProfileUrl(l)) ?? null,
+  const workerSocials = tool?.socials ?? {};
+  const socials: {
+    linkedin: string | null;
+    facebook: string | null;
+    instagram?: string | null;
+    google_maps?: string | null;
+    [key: string]: string | null | undefined;
+  } = {
+    linkedin:
+      workerSocials["linkedin.com"] ??
+      links.find((l) => (hostOf(l) ?? "").endsWith("linkedin.com") && isSocialProfileUrl(l)) ??
+      null,
+    facebook:
+      workerSocials["facebook.com"] ??
+      links.find((l) => (hostOf(l) ?? "").endsWith("facebook.com") && isSocialProfileUrl(l)) ??
+      null,
+    instagram:
+      workerSocials["instagram.com"] ??
+      links.find((l) => (hostOf(l) ?? "").endsWith("instagram.com") && isSocialProfileUrl(l)) ??
+      null,
+    google_maps:
+      workerSocials["maps.google.com"] ??
+      workerSocials["google_maps"] ??
+      links.find((l) => (hostOf(l) ?? "").includes("google.") && (l.includes("/maps") || l.includes("maps/"))) ??
+      null,
+    ...workerSocials,
   };
   const texts: string[] = [
     ...(tool?.texts ?? []),
@@ -1337,24 +1389,25 @@ export async function gatherEvidence(
     ...customTexts,
   ];
 
-
   if (opt.linkedin || opt.facebook) {
     const found = await findSocials(company.clean_name, company.city);
     if (opt.linkedin) socials.linkedin ??= found.linkedin;
     if (opt.facebook) socials.facebook ??= found.facebook;
+    socials.instagram ??= found.instagram;
     texts.push(...found.snippets);
     trail.push(
-      `social: linkedin=${socials.linkedin ? "found" : "none"} facebook=${socials.facebook ? "found" : "none"}`,
+      `social: linkedin=${socials.linkedin ? "found" : "none"} facebook=${socials.facebook ? "found" : "none"} instagram=${socials.instagram ? "found" : "none"} maps=${socials.google_maps ? "found" : "none"}`,
     );
   }
 
-  // Public social pages: LinkedIn/Facebook often expose the website + an email
+  // Public social pages: LinkedIn/Facebook/Instagram often expose the website + an email
   // in their public meta description even when the full page needs a login.
   let pagesScraped = 0;
   const socialUrls = [
     opt.linkedin ? socials.linkedin : null,
     opt.facebook ? socials.facebook?.replace("www.facebook.com", "mbasic.facebook.com") ?? null : null,
     opt.facebook && socials.facebook ? `${socials.facebook.replace(/\/$/, "")}/about` : null,
+    socials.instagram ?? null,
   ].filter((u): u is string => Boolean(u));
   const socialPages = await Promise.all(socialUrls.map((u) => safeFetch(u, 7000)));
   for (const [i, page] of socialPages.entries()) {
@@ -1364,6 +1417,7 @@ export async function gatherEvidence(
     if (!evidenceMatchesCompany(text, company.clean_name, company.neq) || !isCanadianEvidence(text, url)) {
       if (url.includes("facebook.com")) socials.facebook = null;
       if (url.includes("linkedin.com")) socials.linkedin = null;
+      if (url.includes("instagram.com")) socials.instagram = null;
       trail.push(`social rejected (company/Canada mismatch): ${url}`);
       continue;
     }
@@ -1550,7 +1604,15 @@ export async function gatherEvidence(
     statusSources,
     statusConfirmations,
     statusVotes,
-    sourceUrls: Array.from(new Set([...sourceUrls, ...(socials.linkedin ? [socials.linkedin] : []), ...(socials.facebook ? [socials.facebook] : [])])).slice(0, 30),
+    sourceUrls: Array.from(
+      new Set([
+        ...sourceUrls,
+        ...(socials.linkedin ? [socials.linkedin] : []),
+        ...(socials.facebook ? [socials.facebook] : []),
+        ...(socials.instagram ? [socials.instagram] : []),
+        ...(socials.google_maps ? [socials.google_maps] : []),
+      ]),
+    ).slice(0, 30),
     rawExecutionSources: tool?.rawExecutionSources?.slice(0, 20) ?? [],
   };
 }

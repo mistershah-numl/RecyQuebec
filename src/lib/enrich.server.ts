@@ -16,7 +16,7 @@
 // ============================================================================
 import { buildReferences, collectiveScore, getEvidenceRubric, scoreLabel } from "./domain-authority";
 import { addressFromSourceRow, activityFromSourceRow, tradeNamesFromSourceRow, cleanCompanyName } from "./req";
-import { emailPatterns, cleanPersonName, isValidPersonName } from "./osint.server";
+import { emailPatterns, cleanPersonName, isValidPersonName, type Evidence } from "./osint.server";
 import {
   guardRow,
   sharedDomainAllowed,
@@ -895,31 +895,31 @@ export async function enrichCompany(
   // ---------- STAGE 1 — OSINT: search engines, socials, site crawl ----------
   await onStep(`OSINT search started · "${clean}" · ${targets.region ?? "Canada"}${row.city ? ` · ${row.city}` : ""}`);
   const { gatherEvidence } = await import("./osint.server");
-  let evidence = {
-    domain: null as string | null,
-    emails: [] as string[],
-    phones: [] as string[],
-    people: [] as { name: string; title: string }[],
-    snippets: [] as string[],
+  let evidence: Evidence = {
+    domain: null,
+    emails: [],
+    phones: [],
+    people: [],
+    snippets: [],
     pagesScraped: 0,
-    socials: { linkedin: null as string | null, facebook: null as string | null },
-    patternCandidates: [] as string[],
-    genericCandidates: [] as string[],
-    trail: [] as string[],
-    address: null as string | null,
-    registryUrl: null as string | null,
-    registryName: null as string | null,
-    companyStatus: null as string | null,
-    statusSources: [] as string[],
+    socials: {
+      linkedin: null,
+      facebook: null,
+      instagram: null,
+      google_maps: null,
+    },
+    patternCandidates: [],
+    genericCandidates: [],
+    trail: [],
+    address: null,
+    registryUrl: null,
+    registryName: null,
+    companyStatus: null,
+    statusSources: [],
     statusConfirmations: 0,
-    statusVotes: [] as { status: string; raw: string; host: string; labeled: boolean }[],
-    sourceUrls: [] as string[],
-    rawExecutionSources: [] as Array<{
-      url: string;
-      selector: string;
-      extraction_points: string[];
-      html_preview: string;
-    }>,
+    statusVotes: [],
+    sourceUrls: [],
+    rawExecutionSources: [],
   };
   if (targets.skipOsint) {
     await onStep("AI-only mode — skipping OSINT crawling, asking the AI agent directly", "warn");
@@ -967,6 +967,8 @@ export async function enrichCompany(
   if (evidence.trail.length) await onStep(`Sources: ${evidence.trail.join(" · ")}`);
   if (evidence.socials.linkedin) await onStep(`LinkedIn: ${evidence.socials.linkedin}`);
   if (evidence.socials.facebook) await onStep(`Facebook: ${evidence.socials.facebook}`);
+  if (evidence.socials.instagram) await onStep(`Instagram: ${evidence.socials.instagram}`);
+  if (evidence.socials.google_maps) await onStep(`Google Maps: ${evidence.socials.google_maps}`);
   if (evidence.registryUrl) await onStep(`Registry record: ${evidence.registryUrl}`);
   if (evidence.address) await onStep(`Address: ${evidence.address}`);
 
@@ -1009,6 +1011,8 @@ export async function enrichCompany(
       evidence.registryUrl,
       evidence.socials.linkedin,
       evidence.socials.facebook,
+      evidence.socials.instagram,
+      evidence.socials.google_maps,
       evidence.domain ? `https://${evidence.domain}` : null,
     ],
     evidence.domain,
@@ -1019,6 +1023,7 @@ export async function enrichCompany(
     source_score: sourceScore,
     source_score_label: scoreLabel(sourceScore),
     extracted_sources: evidence.rawExecutionSources?.slice(0, 10),
+    socials: evidence.socials,
   };
   if (references.length) {
     await onStep(
@@ -1372,7 +1377,7 @@ Likely domain: ${evidence.domain ?? "unknown"}
 Registry: ${evidence.registryUrl ?? "none"} ${evidence.registryName ?? ""}
 Scraper trail (${evidence.pagesScraped} pages): ${evidence.trail.slice(0, 8).join(" | ") || "none"}
 Address: ${evidence.address ?? "unknown"}
-LinkedIn: ${evidence.socials.linkedin ?? "none"} | Facebook: ${evidence.socials.facebook ?? "none"}
+LinkedIn: ${evidence.socials.linkedin ?? "none"} | Facebook: ${evidence.socials.facebook ?? "none"} | Instagram: ${evidence.socials.instagram ?? "none"} | Maps: ${evidence.socials.google_maps ?? "none"}
 Emails found: ${dedupeList(scrapedEmails, 8).join(", ") || "none"}
 Phones found: ${dedupeList(evidence.phones, 5).join(", ") || "none"}
 People found: ${evidence.people.slice(0, 5).map((p) => `${p.name} (${p.title})`).join("; ") || "none"}
