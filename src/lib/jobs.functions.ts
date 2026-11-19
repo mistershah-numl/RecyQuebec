@@ -35,7 +35,7 @@ export const getSettings = createServerFn({ method: "GET" })
 
       osint_worker_url: row["osint_worker_url"] ?? null,
       osint_worker_secret: mask(row["osint_worker_secret"] ?? null),
-      row_timeout_seconds: Number(row["row_timeout_seconds"] ?? 120),
+      row_timeout_seconds: Number(row["row_timeout_seconds"] ?? 240),
       batch_size: row["batch_size"] === null || row["batch_size"] === undefined ? null : Number(row["batch_size"]),
       default_batch_size: 2,
       email_sender_domain: row["email_sender_domain"] ?? null,

@@ -98,10 +98,12 @@ BAD_EMAIL_HINTS = (
     "cloudflare.com", "protection", "privacy", "whoisguard",
     "lightinthebox.com", "miniinthebox.com", "aliexpress.com", "alibaba.com",
     "temu.com", "shein.com", "wish.com", "dhgate.com", "myshopify.com", "shopify.com",
+    "wikipedia.org", "wikimedia.org", "wikidata.org", "wiktionary.org",
 )
 BAD_HOSTS = (
     "duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com",
-    "microsoft.", "msn.", "live.", "windows.", "wikipedia.org", "wikimedia.org"
+    "microsoft.", "msn.", "live.", "windows.", "wikipedia.org", "wikimedia.org", "wikidata.org",
+    "wiktionary.org", "canada.ca", "gc.ca", "gouv.qc.ca", "quebec.ca"
 )
 
 # Directory / review portals & third-party ordering platforms — never accept these as a company's official domain.
@@ -762,11 +764,32 @@ NON_NAME_WORDS = {
     # Financial, currency and market terms to reject market ticker / forex leakage
     "rupiah", "rupee", "dollar", "euro", "indonesian", "currency", "currencies",
     "devises", "taux", "bourse", "action", "actions", "capital", "banque", "monnaie",
-    "monetaire", "monétaire", "exchange", "trading", "crypto", "bitcoin", "ethereum"
+    "monetaire", "monétaire", "exchange", "trading", "crypto", "bitcoin", "ethereum",
+    # International, diplomatic, and governmental organizations / foreign entities
+    "fonds", "international", "internationale", "organisation", "organization", "fmi", "imf",
+    "onu", "kosovo", "pristina", "serbie", "albanie", "parlement", "gouvernement",
+    "ministere", "ministère", "republique", "république"
 }
 
 
+def is_institutional_name(name: str) -> bool:
+    if not name:
+        return False
+    n = name.strip().lower()
+    return (
+        n.startswith("direction")
+        or n.startswith("administration")
+        or n.startswith("gouvernance")
+        or n.startswith("secrétariat")
+        or n.startswith("secretariat")
+        or n.startswith("bureau")
+    )
+
+
 def clean_person_name(raw: str) -> str:
+    if is_institutional_name(raw):
+        name = re.sub(r"^#+\s*", "", raw).strip()
+        return re.sub(r"^\[([^\]]+)\].*$", r"\1", name).strip()
     name = re.sub(r"^#+\s*", "", raw).strip()
     name = re.sub(r"^\[([^\]]+)\].*$", r"\1", name).strip()
     name = re.sub(r"^(?:Dr\.?|Dre\.?|Me\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*", "", name, flags=re.I).strip()
@@ -780,8 +803,10 @@ def clean_person_name(raw: str) -> str:
 
 
 def is_valid_person_name(name: str) -> bool:
-    if not name or len(name) < 3 or len(name) > 40:
+    if not name or len(name) < 3 or len(name) > 50:
         return False
+    if is_institutional_name(name):
+        return True
     clean = clean_person_name(name)
     parts = clean.split()
     if len(parts) < 2 or len(parts) > 4:
@@ -1703,6 +1728,9 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
 
             # Directory Trap: Extract outbound links
             if is_directory_host(host):
+                if not mentions_company(candidate_text, company_tokens(company_name), body.neq, None):
+                    log.append(f"Directory candidate {host} skipped: page does not mention company '{company_name}'")
+                    continue
                 log.append(f"Directory detected: {host} — extracting outbound company links")
                 emails += clean_emails(EMAIL_RE.findall(candidate_html))
                 phones += [norm_phone(m) for m in PHONE_RE.finditer(candidate_text)]
@@ -1796,15 +1824,20 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
             cand_html = unmask_cloudflare_emails(cand["html"])
             cand_text = clean_html_to_markdown(cand_html)
             host = urlparse(au).netloc.lower().replace("www.", "")
-            if host and "." in host and not any(b in host for b in BAD_HOSTS) and not is_directory_host(host):
-                add_raw_source(au, cand_html, ["address_fallback_match", "contact_info"], "address search match")
-                emails += clean_emails(EMAIL_RE.findall(cand_html))
-                phones += [norm_phone(m) for m in PHONE_RE.finditer(cand_text)]
-                people += extract_people_from_markdown(cand_text)
-                if not domain and trusted_company_page(cand_text, au, company_name, body.neq, None):
-                    domain = host
-                    log.append(f"Domain discovered via address search: {domain}")
-                    break
+            if not host or "." not in host or any(b in host for b in BAD_HOSTS) or is_directory_host(host):
+                continue
+            # CRITICAL: Address hits must verify against the company before ingesting contacts
+            if not trusted_company_page(cand_text, au, company_name, body.neq, host):
+                log.append(f"Address search candidate {host} skipped: page does not mention company '{company_name}'")
+                continue
+            add_raw_source(au, cand_html, ["address_fallback_match", "contact_info"], "address search match")
+            emails += clean_emails(EMAIL_RE.findall(cand_html))
+            phones += [norm_phone(m) for m in PHONE_RE.finditer(cand_text)]
+            people += extract_people_from_markdown(cand_text)
+            if not domain:
+                domain = host
+                log.append(f"Domain discovered via address search: {domain}")
+                break
 
     # 1d. Final foreign-lookalike guard
     if domain and not is_directory_host(domain):

@@ -482,7 +482,7 @@ export async function workerOsint(input: {
     const ctrl = new AbortController();
     const abort = () => ctrl.abort();
     parentSignal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => ctrl.abort(), 160_000);
+    const timer = setTimeout(() => ctrl.abort(), 200_000);
     const res = await fetch(`${base.replace(/\/$/, "")}/osint`, {
       method: "POST",
       headers: {
@@ -891,10 +891,30 @@ const NON_NAME_WORDS = new Set([
   // Financial, currency and market terms to reject market ticker / forex leakage
   "rupiah", "rupee", "dollar", "euro", "indonesian", "currency", "currencies",
   "devises", "taux", "bourse", "action", "actions", "capital", "banque", "monnaie",
-  "monetaire", "monétaire", "exchange", "trading", "crypto", "bitcoin", "ethereum"
+  "monetaire", "monétaire", "exchange", "trading", "crypto", "bitcoin", "ethereum",
+  // International, diplomatic, and governmental organizations / titles
+  "fonds", "international", "internationale", "organisation", "organization", "fmi", "imf",
+  "onu", "kosovo", "pristina", "serbie", "albanie", "parlement", "gouvernement",
+  "ministere", "ministère", "republique", "république"
 ]);
 
+export function isInstitutionalName(name: string): boolean {
+  if (!name) return false;
+  const n = name.trim().toLowerCase();
+  return (
+    n.startsWith("direction") ||
+    n.startsWith("administration") ||
+    n.startsWith("gouvernance") ||
+    n.startsWith("secrétariat") ||
+    n.startsWith("secretariat") ||
+    n.startsWith("bureau")
+  );
+}
+
 export function cleanPersonName(raw: string): string {
+  if (isInstitutionalName(raw)) {
+    return raw.replace(/^#+\s*/, "").replace(/^\[([^\]]+)\].*$/, "$1").trim();
+  }
   return raw
     .replace(/^#+\s*/, "")
     .replace(/^\[([^\]]+)\].*$/, "$1")
@@ -907,7 +927,8 @@ export function cleanPersonName(raw: string): string {
 }
 
 export function isValidPersonName(name: string): boolean {
-  if (!name || name.length < 3 || name.length > 40) return false;
+  if (!name || name.length < 3 || name.length > 50) return false;
+  if (isInstitutionalName(name)) return true;
   const clean = cleanPersonName(name);
   const parts = clean.split(/\s+/);
   if (parts.length < 2 || parts.length > 4) return false;

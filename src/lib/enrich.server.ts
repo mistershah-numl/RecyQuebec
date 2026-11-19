@@ -16,7 +16,7 @@
 // ============================================================================
 import { buildReferences, collectiveScore, getEvidenceRubric, scoreLabel } from "./domain-authority";
 import { addressFromSourceRow, activityFromSourceRow, tradeNamesFromSourceRow, cleanCompanyName } from "./req";
-import { emailPatterns, cleanPersonName, isValidPersonName, type Evidence } from "./osint.server";
+import { emailPatterns, cleanPersonName, isValidPersonName, isInstitutionalName, type Evidence } from "./osint.server";
 import {
   guardRow,
   sharedDomainAllowed,
@@ -67,19 +67,45 @@ export type EnrichResult = {
 };
 
 
-/** DNS-over-HTTPS MX lookup (the Worker runtime has no dns/promises). */
+/** DNS-over-HTTPS MX lookup with Cloudflare + Google DNS dual-provider resilience and retry. */
 export async function hasMx(domain: string, signal?: AbortSignal): Promise<boolean> {
-  try {
-    const res = await fetch(
-      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`,
-      { headers: { accept: "application/dns-json" }, signal: signal ?? null },
-    );
-    if (!res.ok) return false;
-    const json = (await res.json()) as { Answer?: { type: number; data: string }[] };
-    return Boolean(json.Answer?.some((a) => a.type === 15));
-  } catch {
-    return false;
+  const clean = domain.trim().toLowerCase().replace(/^www\./, "");
+  if (!clean || !clean.includes(".")) return false;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // 1. Primary: Cloudflare DoH
+    try {
+      const res = await fetch(
+        `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(clean)}&type=MX`,
+        { headers: { accept: "application/dns-json" }, signal: signal ?? null },
+      );
+      if (res.ok) {
+        const json = (await res.json()) as { Answer?: { type: number; data: string }[] };
+        if (json.Answer && json.Answer.some((a) => a.type === 15)) {
+          return true;
+        }
+      }
+    } catch {}
+
+    // 2. Fallback: Google DNS DoH
+    try {
+      const gRes = await fetch(
+        `https://dns.google/resolve?name=${encodeURIComponent(clean)}&type=MX`,
+        { headers: { accept: "application/json" }, signal: signal ?? null },
+      );
+      if (gRes.ok) {
+        const json = (await gRes.json()) as { Answer?: { type: number; data: string }[] };
+        if (json.Answer && json.Answer.some((a) => a.type === 15)) {
+          return true;
+        }
+      }
+    } catch {}
+
+    if (attempt === 0 && !signal?.aborted) {
+      await new Promise((r) => setTimeout(r, 600));
+    }
   }
+  return false;
 }
 
 type ProviderConfig = { url: string; headers: Record<string, string>; model: string };
@@ -316,19 +342,43 @@ const FREEMAIL = new Set([
 
 const ROLE_LOCAL = /^(info|contact|admin|sales|support|service|ventes|bureau|reception|accueil|hello|office|comptabilite|accounting)$/i;
 
-/** Generic DNS-over-HTTPS lookup (the Worker runtime has no dns/promises). */
+/** Generic DNS-over-HTTPS lookup with dual-provider resilience (Cloudflare + Google DNS) and retry. */
 async function dns(name: string, type: "MX" | "A" | "TXT", signal?: AbortSignal): Promise<string[]> {
-  try {
-    const res = await fetch(
-      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,
-      { headers: { accept: "application/dns-json" }, signal: signal ?? null },
-    );
-    if (!res.ok) return [];
-    const json = (await res.json()) as { Answer?: { data: string }[] };
-    return (json.Answer ?? []).map((a) => a.data);
-  } catch {
-    return [];
+  const clean = name.trim().toLowerCase().replace(/^www\./, "");
+  if (!clean || !clean.includes(".")) return [];
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // 1. Primary: Cloudflare DoH
+    try {
+      const res = await fetch(
+        `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(clean)}&type=${type}`,
+        { headers: { accept: "application/dns-json" }, signal: signal ?? null },
+      );
+      if (res.ok) {
+        const json = (await res.json()) as { Answer?: { data: string }[] };
+        const answers = (json.Answer ?? []).map((a) => a.data).filter(Boolean);
+        if (answers.length > 0) return answers;
+      }
+    } catch {}
+
+    // 2. Fallback: Google DNS DoH
+    try {
+      const gRes = await fetch(
+        `https://dns.google/resolve?name=${encodeURIComponent(clean)}&type=${type}`,
+        { headers: { accept: "application/json" }, signal: signal ?? null },
+      );
+      if (gRes.ok) {
+        const json = (await gRes.json()) as { Answer?: { data: string }[] };
+        const answers = (json.Answer ?? []).map((a) => a.data).filter(Boolean);
+        if (answers.length > 0) return answers;
+      }
+    } catch {}
+
+    if (attempt === 0 && !signal?.aborted) {
+      await new Promise((r) => setTimeout(r, 600));
+    }
   }
+  return [];
 }
 
 /**
@@ -1608,7 +1658,11 @@ export async function processJobBatch(
         DEFAULT_BATCH_SIZE,
     ),
   );
-  const rowTimeoutSeconds = Math.min(3600, Math.max(30, Number(settings?.row_timeout_seconds ?? 120)));
+  const rawTimeout = Number(settings?.row_timeout_seconds);
+  const rowTimeoutSeconds = Math.min(
+    3600,
+    Math.max(30, Number.isFinite(rawTimeout) && rawTimeout >= 180 ? rawTimeout : 240),
+  );
 
   // Recover rows abandoned by a crashed/timed-out invocation. They are retried
   // before new work, up to a fixed cap, so no CSV row is silently left behind.
