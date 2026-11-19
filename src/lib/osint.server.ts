@@ -511,9 +511,30 @@ export async function workerOsint(input: {
   }
 }
 
+const SEARCH_ENGINE_HOSTS = [
+  "search.brave.com",
+  "search.yahoo.com",
+  "ca.search.yahoo.com",
+  "bing.com",
+  "duckduckgo.com",
+  "mojeek.com",
+  "google.com",
+  "google.ca",
+];
+
+function isSearchEngineUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return SEARCH_ENGINE_HOSTS.some((sh) => host === sh || host.endsWith("." + sh));
+  } catch {
+    return false;
+  }
+}
+
 async function safeFetch(url: string, timeoutMs = 8000, parentSignal?: AbortSignal): Promise<string | null> {
+  const isSearch = isSearchEngineUrl(url);
   // Fast path first. Playwright is reserved for blocked/JS-only pages instead
-  // of opening Chromium for every ordinary HTML response.
+  // of opening Chromium for every ordinary HTML response. Never offload search SERPs to browser worker!
   try {
     const ctrl = new AbortController();
     const abort = () => ctrl.abort();
@@ -530,7 +551,10 @@ async function safeFetch(url: string, timeoutMs = 8000, parentSignal?: AbortSign
     });
     clearTimeout(timer);
     parentSignal?.removeEventListener("abort", abort);
-    if (!res.ok) return await workerFetch(url, timeoutMs, parentSignal);
+    if (!res.ok) {
+      if (isSearch) return null;
+      return await workerFetch(url, timeoutMs, parentSignal);
+    }
     const type = res.headers.get("content-type") ?? "";
     if (type && !/(html|text|xml|json)/i.test(type)) return null;
     const text = (await res.text()).slice(0, 400_000);
@@ -538,6 +562,7 @@ async function safeFetch(url: string, timeoutMs = 8000, parentSignal?: AbortSign
   } catch {
     // Browser fallback below.
   }
+  if (isSearch) return null;
   return await workerFetch(url, timeoutMs, parentSignal);
 }
 

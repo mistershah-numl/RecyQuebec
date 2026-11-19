@@ -55,9 +55,9 @@ from playwright.async_api import async_playwright
 # ---------------------------------------------------------------- Configuration
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "shah")
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
-NAV_TIMEOUT = int(os.environ.get("NAV_TIMEOUT_MS", "35000"))
+NAV_TIMEOUT = int(os.environ.get("NAV_TIMEOUT_MS", "18000"))
 MAX_BROWSER_PAGES = max(1, min(8, int(os.environ.get("MAX_BROWSER_PAGES", "3"))))
-RENDER_TIMEOUT = max(10, min(90, int(os.environ.get("RENDER_TIMEOUT_SECONDS", "30"))))
+RENDER_TIMEOUT = max(10, min(90, int(os.environ.get("RENDER_TIMEOUT_SECONDS", "35"))))
 OSINT_TIMEOUT = max(30, min(300, int(os.environ.get("OSINT_TIMEOUT_SECONDS", "150"))))
 SMTP_TIMEOUT = max(10, min(120, int(os.environ.get("SMTP_TIMEOUT_SECONDS", "30"))))
 MAX_OSINT_BROWSER_FALLBACKS = max(0, min(6, int(os.environ.get("MAX_OSINT_BROWSER_FALLBACKS", "2"))))
@@ -139,7 +139,8 @@ def name_matches_host(company_name: str, trade_names: List[str], host: str) -> b
     flat = host.replace(".", "").replace("-", "")
     all_names = [company_name] + list(trade_names)
     for name in all_names:
-        token = deaccent(LEGAL_SUFFIX_RE.sub(" ", name).strip()).replace(" ", "")
+        clean = deaccent(LEGAL_SUFFIX_RE.sub(" ", name).strip().lower())
+        token = clean.replace(" ", "")
         if not token or len(token) < 3:
             continue
         if flat.startswith(token[:8]) or token.startswith(base[:8]):
@@ -149,6 +150,18 @@ def name_matches_host(company_name: str, trade_names: List[str], host: str) -> b
         head = token[:max(5, min(8, len(token)))]
         if base.startswith(head) or head.startswith(base[:6]):
             return True
+        # Check individual significant words (e.g. 'brises', 'ntetemuk')
+        words = [w for w in re.split(r"[^a-z0-9]+", clean) if len(w) >= 4 and w not in ("centre", "groupe", "services", "solutions", "canada", "quebec")]
+        for w in words:
+            if w in base or (len(base) >= 5 and base in w):
+                return True
+        # Check acronym windows (e.g. 'vdb' from 'val des brises')
+        raw_words = [w for w in re.split(r"[^a-z0-9]+", clean) if w]
+        for n in (3, 4):
+            for i in range(len(raw_words) - n + 1):
+                acr = "".join(w[0] for w in raw_words[i:i+n])
+                if len(acr) >= 3 and acr in base:
+                    return True
     return False
 
 
@@ -330,7 +343,29 @@ async def render(body: RenderIn, x_worker_secret: Optional[str] = Header(None)):
         app.state.stats["queued"] = max(0, app.state.stats["queued"] - 1)
 
 
+def is_search_engine_url(url: str) -> bool:
+    u = url.lower()
+    return any(h in u for h in ("search.brave.com", "search.yahoo.com", "ca.search.yahoo.com", "mojeek.com", "duckduckgo.com", "google.com/search", "bing.com/search"))
+
+
 async def _render_impl(body: RenderIn):
+    if is_search_engine_url(body.url):
+        # Fast path for search engine queries — never launch Chromium for search queries!
+        try:
+            async with httpx.AsyncClient(
+                timeout=12,
+                follow_redirects=True,
+                headers={"User-Agent": UA_SEARCH, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
+            ) as client:
+                r = await client.get(body.url)
+                html = unmask_cloudflare_emails(r.text)
+                text = clean_html_to_markdown(html)
+                app.state.stats["completed"] += 1
+                return {"ok": r.status_code == 200, "status": r.status_code, "url": body.url, "html": html, "text": text}
+        except Exception as e:
+            app.state.stats["failed"] += 1
+            return {"ok": False, "status": 0, "url": body.url, "error": str(e), "html": "", "text": ""}
+
     async with app.state.lock:
         app.state.stats["active"] += 1
         context = None
@@ -366,36 +401,35 @@ async def _render_impl(body: RenderIn):
             resp = await page.goto(body.url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
             status = resp.status if resp else 0
 
-            # Interstitial check
-            for _ in range(12):
+            # Interstitial check (up to 4 checks = ~3 seconds max)
+            for _ in range(4):
                 html_check = await page.content()
                 title_check = (await page.title()) or ""
                 if ("Just a moment" not in title_check
                         and "cf-challenge" not in html_check
                         and "challenge-platform" not in html_check):
                     break
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(800)
 
-            # Click reveal buttons for emails/contacts
-            for selector in [
-                "text=Show email", "text=Show phone", "text=Reveal",
-                "text=Afficher", "button:has-text('email')", "button:has-text('contact')",
-            ]:
-                try:
-                    btn = page.locator(selector).first
-                    if await btn.count() > 0 and await btn.is_visible():
-                        await btn.click(timeout=1500)
-                        await page.wait_for_timeout(400)
-                except Exception:
-                    pass
+            # Fast in-page JavaScript evaluation to click reveal / show email buttons in <10ms
+            with suppress(Exception):
+                await page.evaluate("""() => {
+                    const targets = ['show email', 'show phone', 'reveal', 'afficher', 'voir le courriel', 'voir le numéro', 'contact'];
+                    for (const el of document.querySelectorAll('button, a, span')) {
+                        const txt = (el.innerText || '').toLowerCase().trim();
+                        if (targets.some(t => txt === t || txt.startsWith(t))) {
+                            try { el.click(); } catch (e) {}
+                        }
+                    }
+                }""")
 
             if body.wait_selector:
                 try:
-                    await page.wait_for_selector(body.wait_selector, timeout=5000)
+                    await page.wait_for_selector(body.wait_selector, timeout=3000)
                 except Exception:
                     pass
 
-            await page.wait_for_timeout(body.wait_ms)
+            await page.wait_for_timeout(min(body.wait_ms, 1200))
             html = unmask_cloudflare_emails(await page.content())
             text = clean_html_to_markdown(html)
             app.state.stats["completed"] += 1
@@ -710,8 +744,9 @@ def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
             if norm in seen:
                 continue
 
-            m_t = EXEC_TITLE_RE.search(link_text)
-            title = m_t.group(0).strip() if m_t else "Executive"
+            link_no_prefix = re.sub(r"^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*", "", link_text, flags=re.I)
+            m_t = EXEC_TITLE_RE.search(link_no_prefix) or EXEC_TITLE_RE.search(link_text)
+            title = m_t.group(0).strip() if m_t else ("Dr" if link_text.lower().startswith("dr") else "Executive")
             seen.add(norm)
             results.append({
                 "name": clean_l,
@@ -1345,10 +1380,10 @@ async def _osint_impl(body: OsintIn):
 
             if maps_web and not domain:
                 maps_host = urlparse(maps_web).netloc.lower().replace("www.", "")
-                if maps_host and not is_directory_host(maps_host) and name_matches_host(company_name, input_trade_names, maps_host):
+                if maps_host and not is_directory_host(maps_host) and not any(b in maps_host for b in BAD_HOSTS):
                     domain = maps_host
                     log.append(f"Google Maps: Discovered official domain -> {domain}")
-                    print(f"      🌐 Discovered domain: {domain}", flush=True)
+                    print(f"      🌐 Discovered domain from Google Maps: {domain}", flush=True)
 
             if maps_result.get("html"):
                 add_raw_source(
@@ -1737,7 +1772,17 @@ async def _osint_impl(body: OsintIn):
                                 break
 
                     if "linkedin.com/in" in candidate_url:
-                        lp_people = extract_people_from_markdown(candidate_text)
+                        lp_people = extract_people_from_markdown(candidate_text) + extract_people_from_dom(candidate_html)
+                        soup_l = BeautifulSoup(candidate_html, "html.parser")
+                        title_el = soup_l.find("title")
+                        if title_el:
+                            t_txt = title_el.get_text(" ", strip=True)
+                            t_parts = [p.strip() for p in re.split(r"[-–|•]", t_txt) if p.strip()]
+                            if t_parts:
+                                cand_p_name = clean_person_name(t_parts[0])
+                                if is_valid_person_name(cand_p_name):
+                                    cand_p_title = t_parts[1] if len(t_parts) > 1 and not any(w in t_parts[1].lower() for w in ("linkedin", "profile")) else "Executive"
+                                    lp_people.append({"name": cand_p_name, "title": cand_p_title, "email": None, "phone": None})
                         for lp in lp_people:
                             if not any(x["name"].lower() == lp["name"].lower() for x in people):
                                 people.append(lp)
@@ -1759,7 +1804,7 @@ async def _osint_impl(body: OsintIn):
                 candidate_html = unmask_cloudflare_emails(candidate.get("html", ""))
                 candidate_text = clean_html_to_markdown(candidate_html)
                 if trusted_company_page(candidate_text, candidate_url, company_name, body.neq, domain):
-                    found_execs = extract_people_from_markdown(candidate_text)
+                    found_execs = extract_people_from_dom(candidate_html) + extract_people_from_markdown(candidate_text)
                     for fe in found_execs:
                         if not any(x["name"].lower() == fe["name"].lower() for x in people):
                             people.append(fe)
