@@ -128,14 +128,39 @@ const EXECUTIVE_NAME_PATTERNS = [
  * How close a hostname is to the company name. Used so we only ever treat a
  * site as "the company website" when its domain really looks like the company.
  */
-function nameMatchesHost(token: string, host: string): boolean {
-  if (!token || token.length < 4) return false;
+function nameMatchesHost(token: string, host: string, originalName?: string): boolean {
+  if (!token || token.length < 3) return false;
   const base = (host.split(".")[0] ?? "").replace(/[^a-z0-9]/g, "");
   if (!base || base.length < 3) return false;
   const flat = host.replace(/[^a-z0-9]/g, "");
   if (flat.includes(token) || token.includes(base)) return true;
-  const head = token.slice(0, Math.max(5, Math.min(8, token.length)));
-  return base.startsWith(head) || token.startsWith(base.slice(0, 6));
+  const head = token.slice(0, Math.max(4, Math.min(6, token.length)));
+  if (base.startsWith(head) || token.startsWith(base.slice(0, 5))) return true;
+
+  // Check distinctive words from originalName or token
+  const nameToParse = originalName || token;
+  const words = nameToParse
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !["inc", "ltee", "corp", "ltd", "cie", "coop", "canada", "quebec"].includes(w));
+  for (const w of words) {
+    if (w.length >= 4 && (base.includes(w) || w.includes(base))) return true;
+  }
+  // Check acronym initials (e.g. vdb in dentistesvdb for Val des Brises)
+  if (words.length >= 2) {
+    const initials = words.map((w) => w[0]).join("");
+    if (initials.length >= 2 && base.includes(initials)) return true;
+    for (let i = 0; i < words.length - 1; i++) {
+      const slice2 = words.slice(i, i + 2).map((w) => w[0]).join("");
+      const slice3 = words.slice(i, i + 3).map((w) => w[0]).join("");
+      if (slice2.length === 2 && base.endsWith(slice2)) return true;
+      if (slice3.length === 3 && base.includes(slice3)) return true;
+    }
+  }
+  return false;
 }
 
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
@@ -1518,11 +1543,12 @@ export async function gatherEvidence(
 
   // Only accept a site whose hostname actually resembles the company name —
   // otherwise we would "enrich" a company with a random directory or portal.
-  let candidate = candidates.find((l) => nameMatchesHost(token, hostOf(l) ?? "")) ?? null;
+  let candidate = candidates.find((l) => nameMatchesHost(token, hostOf(l) ?? "", company.clean_name)) ?? null;
   let domain = candidate ? hostOf(candidate) : null;
   if (!domain && tool?.domain) {
     const workerDomain = tool.domain.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-    if (nameMatchesHost(token, workerDomain) && inRegion(workerDomain, opt.countryLock !== false)) {
+    const workerConfirmed = Boolean((tool.people && tool.people.length > 0) || (tool.emails && tool.emails.length > 0));
+    if ((nameMatchesHost(token, workerDomain, company.clean_name) || workerConfirmed) && inRegion(workerDomain, opt.countryLock !== false)) {
       domain = workerDomain;
       candidate = `https://${domain}`;
       trail.push(`validated domain from worker: ${domain}`);

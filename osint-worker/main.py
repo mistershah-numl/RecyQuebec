@@ -1378,6 +1378,7 @@ async def osint(body: OsintIn, x_worker_secret: Optional[str] = Header(None)):
     if body.neq:
         print(f"   📋 NEQ: {body.neq} | City: {body.city or 'N/A'} | Province: {body.province or 'Quebec'}", flush=True)
     t0 = time.time()
+
     state_box: Dict[str, Any] = {
         "ok": False,
         "domain": body.domain,
@@ -1391,6 +1392,16 @@ async def osint(body: OsintIn, x_worker_secret: Optional[str] = Header(None)):
         "raw_execution_sources": [],
         "cross_check": {},
     }
+
+    # Ensure browser is available before starting
+    try:
+        if not app.state.browser or not app.state.browser.is_connected():
+            print(f"   🔧 Initializing browser...", flush=True)
+            await ensure_browser(app)
+    except Exception as e:
+        state_box["log"].append(f"Browser initialization warning: {e}")
+        print(f"   ⚠️ Browser init: {e}", flush=True)
+
     try:
         res = await asyncio.wait_for(_osint_impl(body, state_box), timeout=OSINT_TIMEOUT)
         dur = round(time.time() - t0, 1)
@@ -1408,7 +1419,7 @@ async def osint(body: OsintIn, x_worker_secret: Optional[str] = Header(None)):
         print(f"{'='*70}\n", flush=True)
         return res
     except asyncio.TimeoutError:
-        app.state.stats["failed"] += 1
+        app.state.stats["failed"] = app.state.stats.get("failed", 0) + 1
         found = bool(state_box["emails"] or state_box["phones"] or state_box["people"] or state_box["domain"])
         print(f"⏱️ [OSINT] Timeout after {OSINT_TIMEOUT}s for: '{cname}' -> returning partial discoveries (found={found})\n{'='*70}\n", flush=True)
         state_box["ok"] = found
@@ -1416,15 +1427,19 @@ async def osint(body: OsintIn, x_worker_secret: Optional[str] = Header(None)):
         state_box["error"] = f"company deadline exceeded ({OSINT_TIMEOUT}s)"
         state_box["log"].append("company deadline reached; partial results preserved")
         state_box["trail"] = state_box["log"][-30:]
+        state_box["elapsed_s"] = round(time.time() - t0, 1)
         return state_box
     except Exception as e:
-        app.state.stats["failed"] += 1
+        app.state.stats["failed"] = app.state.stats.get("failed", 0) + 1
         print(f"❌ [OSINT] Internal error for '{cname}': {e}\n{'='*70}\n", flush=True)
+        import traceback
+        traceback.print_exc()
         found = bool(state_box["emails"] or state_box["phones"] or state_box["people"] or state_box["domain"])
         state_box["ok"] = found
         state_box["error"] = str(e)
         state_box["log"].append(f"worker internal error: {e}")
         state_box["trail"] = state_box["log"][-30:]
+        state_box["elapsed_s"] = round(time.time() - t0, 1)
         return state_box
 
 
@@ -2014,9 +2029,14 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
         except Exception as ex:
             return value, None, ex
 
+    # For emails directly on the verified corporate domain, they are authoritative from the site.
+    # Only reverse cross-check external emails and phones across search engines.
+    to_check_emails = [e for e in emails if not (domain and e.endswith("@" + domain))][:3]
+    to_check_phones = phones[:2]
+
     checks = await asyncio.gather(
-        *(check_identifier(e, "email") for e in emails[:8]),
-        *(check_identifier(p, "phone") for p in phones[:3]),
+        *(check_identifier(e, "email") for e in to_check_emails),
+        *(check_identifier(p, "phone") for p in to_check_phones),
     )
     for value, rc, error in checks:
         if rc:
