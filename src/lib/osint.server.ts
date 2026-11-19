@@ -482,7 +482,7 @@ export async function workerOsint(input: {
     const ctrl = new AbortController();
     const abort = () => ctrl.abort();
     parentSignal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => ctrl.abort(), 75_000);
+    const timer = setTimeout(() => ctrl.abort(), 160_000);
     const res = await fetch(`${base.replace(/\/$/, "")}/osint`, {
       method: "POST",
       headers: {
@@ -887,7 +887,11 @@ const NON_NAME_WORDS = new Set([
   "website", "mission", "vision", "valeurs", "values", "history", "histoire", "temoignages",
   "témoignages", "reviews", "avis", "faq", "heures", "hours", "horaire", "schedule", "location",
   "emplacement", "adresse", "address", "telephone", "téléphone", "courriel", "email", "contactez",
-  "suivez", "follow", "social"
+  "suivez", "follow", "social",
+  // Financial, currency and market terms to reject market ticker / forex leakage
+  "rupiah", "rupee", "dollar", "euro", "indonesian", "currency", "currencies",
+  "devises", "taux", "bourse", "action", "actions", "capital", "banque", "monnaie",
+  "monetaire", "monétaire", "exchange", "trading", "crypto", "bitcoin", "ethereum"
 ]);
 
 export function cleanPersonName(raw: string): string {
@@ -911,7 +915,7 @@ export function isValidPersonName(name: string): boolean {
     return false;
   }
   for (const p of parts) {
-    if (!/^[A-ZÀ-Ý][a-zà-ÿ'’-]+$/.test(p)) return false;
+    if (!/^[A-ZÀ-Ý](\.|[a-zà-ÿ'’-]+)$/.test(p)) return false;
   }
   return true;
 }
@@ -1103,8 +1107,16 @@ async function probeDomainGuess(token: string): Promise<string | null> {
   const tlds = [".com", ".ca", ".qc.ca", ".net"];
   for (const tld of tlds) {
     const host = `${token}${tld}`;
-    const html = await safeFetch(`https://${host}`, 5000);
-    if (html && html.length > 500) return host;
+    try {
+      const res = await fetch(`https://${host}`, {
+        method: "HEAD",
+        signal: AbortSignal.timeout(2500),
+        headers: { "user-agent": UA },
+      });
+      if (res.ok) return host;
+    } catch {
+      // try next
+    }
   }
   return null;
 }
@@ -1585,14 +1597,19 @@ export async function gatherEvidence(
   // otherwise we would "enrich" a company with a random directory or portal.
   let candidate = candidates.find((l) => nameMatchesHost(token, hostOf(l) ?? "", company.clean_name)) ?? null;
   let domain = candidate ? hostOf(candidate) : null;
-  if (!domain && tool?.domain) {
+  if (tool?.domain) {
     const workerDomain = tool.domain.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-    const workerConfirmed = Boolean((tool.people && tool.people.length > 0) || (tool.emails && tool.emails.length > 0));
-    if ((nameMatchesHost(token, workerDomain, company.clean_name) || workerConfirmed) && inRegion(workerDomain, opt.countryLock !== false)) {
+    const workerConfirmed = Boolean(
+      (tool.people && tool.people.length > 0) ||
+      (tool.emails && tool.emails.length > 0) ||
+      (tool.phones && tool.phones.length > 0) ||
+      nameMatchesHost(token, workerDomain, company.clean_name)
+    );
+    if ((workerConfirmed || !domain) && inRegion(workerDomain, opt.countryLock !== false)) {
       domain = workerDomain;
       candidate = `https://${domain}`;
       trail.push(`validated domain from worker: ${domain}`);
-    } else {
+    } else if (!domain) {
       trail.push(`worker domain rejected (company/region mismatch): ${workerDomain}`);
     }
   }
@@ -1740,11 +1757,27 @@ export async function gatherEvidence(
     }
   }
 
+  if (tool?.texts && tool.texts.length > 0) {
+    texts.push(...tool.texts);
+  }
   const joined = texts.join("\n");
   const people = [...(tool?.people ?? []), ...registryPeople, ...collectPeople(joined)].filter(
     (p, i, arr) => arr.findIndex((q) => q.name.toLowerCase() === p.name.toLowerCase()) === i,
   );
-  const emails = collectEmails(joined, domain, company.clean_name || company.company_name);
+  const emails = Array.from(
+    new Set([
+      ...(tool?.emails ?? []),
+      ...((tool?.people ?? []).map((p) => p.email).filter(Boolean) as string[]),
+      ...collectEmails(joined, domain, company.clean_name || company.company_name),
+    ]),
+  );
+  const phones = Array.from(
+    new Set([
+      ...(tool?.phones ?? []),
+      ...((tool?.people ?? []).map((p) => p.phone).filter(Boolean) as string[]),
+      ...collectPhones(joined),
+    ]),
+  );
   const finalAddress =
     address ?? tool?.address ?? extractAddress(joined, company.postal_code ?? null) ?? null;
 
@@ -1764,7 +1797,7 @@ export async function gatherEvidence(
     domain,
     genericCandidates,
     emails,
-    phones: collectPhones(joined),
+    phones,
     people,
     snippets: texts.filter(Boolean).map((t) => t.slice(0, 800)).slice(0, 10),
     pagesScraped,

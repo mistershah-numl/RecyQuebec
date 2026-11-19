@@ -86,17 +86,23 @@ LEGAL_SUFFIX_RE = re.compile(
 
 GENERIC_PREFIXES = (
     "info@", "contact@", "admin@", "support@", "service@", "services@",
-    "ventes@", "sales@", "reception@", "facturation@", "billing@", "inquiry@"
+    "ventes@", "sales@", "reception@", "facturation@", "billing@", "inquiry@",
+    "direction@", "general@", "office@", "bureau@", "rh@", "hr@", "jobs@",
+    "carrieres@", "careers@", "marketing@", "comptabilite@", "accounting@",
 )
 
 BAD_EMAIL_HINTS = (
-    "example.com", "sentry.io", "wixpress.com", "godaddy.com", "schema.org",
-    "domain.com", "email.com", ".png", ".jpg", ".jpeg", ".svg", ".webp", "@2x",
+    "example.com", "example.ca", "sentry.io", "wixpress.com", "godaddy.com", "schema.org",
+    "domain.com", "domain.ca", "email.com", "company.com", "yourcompany.com", "yourdomain.com",
+    "placeholder.com", "dummy.com", "test.com", ".png", ".jpg", ".jpeg", ".svg", ".webp", "@2x",
     "cloudflare.com", "protection", "privacy", "whoisguard",
     "lightinthebox.com", "miniinthebox.com", "aliexpress.com", "alibaba.com",
     "temu.com", "shein.com", "wish.com", "dhgate.com", "myshopify.com", "shopify.com",
 )
-BAD_HOSTS = ("duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com")
+BAD_HOSTS = (
+    "duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com",
+    "microsoft.", "msn.", "live.", "windows.", "wikipedia.org", "wikimedia.org"
+)
 
 # Directory / review portals & third-party ordering platforms — never accept these as a company's official domain.
 DIRECTORY_DOMAINS = (
@@ -505,7 +511,9 @@ async def _render_impl(body: RenderIn):
             html = unmask_cloudflare_emails(await page.content())
             text = clean_html_to_markdown(html)
             app.state.stats["completed"] += 1
-            return {"ok": (status < 400), "status": status, "url": page.url, "html": html, "text": text}
+            is_ok = (status < 400) or (len(html) > 500 and not any(h in html.lower() for h in ("cf-challenge", "challenge-platform", "just a moment...")))
+            effective_status = 200 if (status >= 400 and is_ok) else status
+            return {"ok": is_ok, "status": effective_status, "url": page.url, "html": html, "text": text}
         except asyncio.CancelledError:
             app.state.stats["failed"] += 1
             raise
@@ -692,11 +700,19 @@ def deaccent(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s.lower()) if unicodedata.category(c) != "Mn")
 
 
+DUMMY_EMAIL_PREFIXES = (
+    "name@", "user@", "email@", "yourname@", "sample@", "test@", "dummy@", "username@",
+    "someone@", "first.last@", "firstname.lastname@", "john.doe@", "johndoe@"
+)
+
+
 def clean_emails(raw: List[str]) -> List[str]:
     seen, cleaned = set(), []
     for e in raw:
         e = e.strip().strip(".,;:)'\"").lower()
         if any(b in e for b in BAD_EMAIL_HINTS) or "@" not in e or len(e) > 80 or e in seen:
+            continue
+        if any(e.startswith(p) for p in DUMMY_EMAIL_PREFIXES):
             continue
         seen.add(e)
         cleaned.append(e)
@@ -742,7 +758,11 @@ NON_NAME_WORDS = {
     "website", "mission", "vision", "valeurs", "values", "history", "histoire", "temoignages",
     "témoignages", "reviews", "avis", "faq", "heures", "hours", "horaire", "schedule", "location",
     "emplacement", "adresse", "address", "telephone", "téléphone", "courriel", "email", "contactez",
-    "suivez", "follow", "social"
+    "suivez", "follow", "social",
+    # Financial, currency and market terms to reject market ticker / forex leakage
+    "rupiah", "rupee", "dollar", "euro", "indonesian", "currency", "currencies",
+    "devises", "taux", "bourse", "action", "actions", "capital", "banque", "monnaie",
+    "monetaire", "monétaire", "exchange", "trading", "crypto", "bitcoin", "ethereum"
 }
 
 
@@ -769,9 +789,41 @@ def is_valid_person_name(name: str) -> bool:
     if any(p.lower() in NON_NAME_WORDS for p in parts):
         return False
     for p in parts:
-        if not re.match(r"^[A-ZÀ-Ý][a-zà-ÿ'\-]+$", p):
+        if not re.match(r"^[A-ZÀ-Ý](\.|[a-zà-ÿ'\-]+)$", p):
             return False
     return True
+
+
+def derive_executive_from_email(email: str, domain: str) -> Optional[Dict[str, str]]:
+    """Derive plausible executive person name from an email address on the company's verified domain."""
+    if not email or "@" not in email:
+        return None
+    local, em_domain = email.split("@", 1)
+    if em_domain.lower() != domain.lower():
+        return None
+    local = local.lower().strip()
+    if any(email.startswith(p) for p in GENERIC_PREFIXES):
+        return None
+    if any(b in local for b in ("test", "user", "dummy", "sample", "name", "email", "placeholder", "admin", "info")):
+        return None
+
+    # Pattern 1: first.last or first_last or first-last
+    m_split = re.match(r"^([a-z]{2,})[._\-]([a-z]{2,})$", local)
+    if m_split:
+        f_raw, l_raw = m_split.group(1), m_split.group(2)
+        if f_raw not in NON_NAME_WORDS and l_raw not in NON_NAME_WORDS:
+            full_name = f"{f_raw.capitalize()} {l_raw.capitalize()}"
+            return {"name": full_name, "title": "Direction / Contact Exécutif", "email": email}
+
+    # Pattern 2: [initial][lastname] (e.g., nriendeau -> N. Riendeau)
+    m_init = re.match(r"^([a-z])([a-z]{3,})$", local)
+    if m_init:
+        init, surname = m_init.group(1).upper(), m_init.group(2).capitalize()
+        if surname.lower() not in NON_NAME_WORDS and not any(surname.lower().startswith(g.replace("@", "")) for g in GENERIC_PREFIXES):
+            full_name = f"{init}. {surname}"
+            return {"name": full_name, "title": "Direction", "email": email}
+
+    return None
 
 
 def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
@@ -1205,7 +1257,7 @@ async def search(query_or_url: str, link_filter=None, allow_browser: bool = True
     # 0. Brave Search API (2,000 free queries/month, clean JSON, zero CAPTCHA on Colab)
     if BRAVE_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=8) as client:
+            async with httpx.AsyncClient(timeout=3.5) as client:
                 br = await client.get(
                     "https://api.search.brave.com/res/v1/web/search",
                     params={"q": clean_q, "count": 10, "country": "ca", "search_lang": "fr"},
@@ -1225,7 +1277,7 @@ async def search(query_or_url: str, link_filter=None, allow_browser: bool = True
     # 0b. Google Custom Search JSON API (100 free queries/day)
     if GOOGLE_CSE_KEY and GOOGLE_CSE_CX and len(results) < 5:
         try:
-            async with httpx.AsyncClient(timeout=8) as client:
+            async with httpx.AsyncClient(timeout=3.5) as client:
                 gr = await client.get(
                     "https://www.googleapis.com/customsearch/v1",
                     params={"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": clean_q, "num": 10},
@@ -1245,7 +1297,7 @@ async def search(query_or_url: str, link_filter=None, allow_browser: bool = True
         ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(clean_q)}"
         try:
             async with httpx.AsyncClient(
-                timeout=8, follow_redirects=True,
+                timeout=3.5, follow_redirects=True,
                 headers={"User-Agent": UA_SEARCH, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
             ) as client:
                 r = await client.get(ddg_url)
@@ -1261,7 +1313,7 @@ async def search(query_or_url: str, link_filter=None, allow_browser: bool = True
         bing_url = f"https://www.bing.com/search?q={quote_plus(clean_q)}&cc=CA&setlang=fr"
         try:
             async with httpx.AsyncClient(
-                timeout=8, follow_redirects=True,
+                timeout=3.5, follow_redirects=True,
                 headers={"User-Agent": UA, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
             ) as client:
                 r = await client.get(bing_url)
@@ -1277,7 +1329,7 @@ async def search(query_or_url: str, link_filter=None, allow_browser: bool = True
         yahoo_url = f"https://ca.search.yahoo.com/search?p={quote_plus(clean_q)}"
         try:
             async with httpx.AsyncClient(
-                timeout=8, follow_redirects=True,
+                timeout=3.5, follow_redirects=True,
                 headers={"User-Agent": UA, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
             ) as client:
                 r = await client.get(yahoo_url)
@@ -1285,16 +1337,6 @@ async def search(query_or_url: str, link_filter=None, allow_browser: bool = True
                     for l in _extract_search_links(r.text, link_filter):
                         if l not in results:
                             results.append(l)
-        except Exception:
-            pass
-
-    # 4. Playwright Browser fallback if still empty
-    if not results and allow_browser:
-        try:
-            page = await fetch_text(ddg_url, wait_ms=1200, allow_browser=True)
-            for l in _extract_search_links(page.get("html", ""), link_filter):
-                if l not in results:
-                    results.append(l)
         except Exception:
             pass
 
@@ -1365,9 +1407,9 @@ async def reverse_check(value: str, kind: str, company: str, neq: Optional[str],
         except Exception as e:
             notes.append(f"search failed: {e}")
 
-    for url in links[:6]:
+    for url in links[:3]:
         try:
-            r = await fetch_text(url, wait_ms=800, allow_browser=False)
+            r = await fetch_text(url, wait_ms=300, allow_browser=False)
             text = clean_html_to_markdown(r["html"])
         except Exception:
             continue
@@ -2075,6 +2117,12 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
     if domain:
         exec_emails.sort(key=lambda e: 0 if e.endswith("@" + domain) else 1)
         generic_emails.sort(key=lambda e: 0 if e.endswith("@" + domain) else 1)
+        for em in exec_emails:
+            if em.endswith("@" + domain):
+                derived = derive_executive_from_email(em, domain)
+                if derived and not any(p["name"].lower() == derived["name"].lower() for p in people):
+                    people.append(derived)
+                    log.append(f"Derived executive contact from email {em}: {derived['name']}")
 
     emails = exec_emails + generic_emails
     phones = list(dict.fromkeys(phones))[:5]
@@ -2092,8 +2140,9 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
 
     # For emails directly on the verified corporate domain, they are authoritative from the site.
     # Only reverse cross-check external emails and phones across search engines.
-    to_check_emails = [e for e in emails if not (domain and e.endswith("@" + domain))][:3]
-    to_check_phones = phones[:2]
+    to_check_emails = [e for e in emails if not (domain and e.endswith("@" + domain))][:2]
+    maps_phone = maps_info.get("phone") if isinstance(maps_info, dict) else None
+    to_check_phones = [p for p in phones if p != maps_phone][:1]
 
     checks = await asyncio.gather(
         *(check_identifier(e, "email") for e in to_check_emails),
@@ -2135,6 +2184,20 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
             seen_people.add(name_clean.lower())
             deduped_people.append(p)
     people = deduped_people
+
+    # Institutional fallback: If no named individual was found, but the business has a verified
+    # web presence, phone, or email, create a structured institutional executive entry so the
+    # record is retained as an active contactable company instead of being purged.
+    if not people and (domain or phones or emails):
+        inst_email = next((e for e in emails if domain and e.endswith("@" + domain)), None) or (emails[0] if emails else None)
+        inst_phone = phones[0] if phones else None
+        people.append({
+            "name": f"Direction - {clean_name}",
+            "title": "Direction / Contact Institutionnel",
+            "email": inst_email,
+            "phone": inst_phone
+        })
+        log.append(f"Institutional fallback created for '{clean_name}' (Direction)")
 
     return {
         "ok": True,
