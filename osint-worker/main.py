@@ -73,8 +73,16 @@ UA = (
 )
 UA_SEARCH = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
+VALID_CANADIAN_AREA_CODES = {
+    "418", "581", "367", "450", "579", "514", "438", "819", "873",
+    "800", "888", "877", "866", "855", "844", "833",
+    "204", "226", "236", "249", "250", "289", "306", "343", "403",
+    "416", "431", "506", "519", "587", "604", "613", "639", "647",
+    "705", "709", "778", "780", "782", "807", "825", "867", "902", "905"
+}
+
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-PHONE_RE = re.compile(r"(?:\+?1[\s.\-]?)?\(?([2-9]\d{2})\)?[\s.\-]?(\d{3})[\s.\-]?(\d{4})")
+PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.\-]?)?\(?([2-9]\d{2})\)?[\s.\-]?(\d{3})[\s.\-]?(\d{4})(?!\d)")
 EXEC_TITLE_RE = re.compile(
     r"\b(Président|Présidente|Directeur Général|Directrice Générale|DG|PDG|Fondateur|Fondatrice|Propriétaire|CEO|President|Owner|Directeur|Directrice|VP|Vice-Président|Vice-Présidente|Partner|Associé|Associée|Managing Director|General Manager|Principal|Executive Director|Administrateur|Administratrice|Leader|Dentiste|Chirurgien|Chirurgienne|Docteur|Docteure|Dr|Médecin|Avocat|Avocate|Notaire|Comptable|Gestionnaire|Secrétaire|Trésorier|Trésorière)\b",
     re.IGNORECASE,
@@ -86,9 +94,11 @@ LEGAL_SUFFIX_RE = re.compile(
 
 GENERIC_PREFIXES = (
     "info@", "contact@", "admin@", "support@", "service@", "services@",
-    "ventes@", "sales@", "reception@", "facturation@", "billing@", "inquiry@",
+    "ventes@", "sales@", "reception@", "facturation@", "billing@", "inquiry@", "inquiries@",
     "direction@", "general@", "office@", "bureau@", "rh@", "hr@", "jobs@",
     "carrieres@", "careers@", "marketing@", "comptabilite@", "accounting@",
+    "demande@", "demandes@", "quotes@", "soumission@", "soumissions@", "client@", "clients@",
+    "order@", "commandes@", "dispatch@",
 )
 
 BAD_EMAIL_HINTS = (
@@ -103,7 +113,10 @@ BAD_EMAIL_HINTS = (
 BAD_HOSTS = (
     "duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com",
     "microsoft.", "msn.", "live.", "windows.", "wikipedia.org", "wikimedia.org", "wikidata.org",
-    "wiktionary.org", "canada.ca", "gc.ca", "gouv.qc.ca", "quebec.ca"
+    "wiktionary.org", "canada.ca", "gc.ca", "gouv.qc.ca", "quebec.ca",
+    "tradingview.com", "marketwatch.com", "investing.com", "thefreedictionary.com",
+    "calculator.name", "calculateme.com", "coolconversion.com", "apkmirror.com",
+    "zhihu.com", "uhrforum.de"
 )
 
 # Directory / review portals & third-party ordering platforms — never accept these as a company's official domain.
@@ -596,8 +609,9 @@ async def _search_google_maps_impl(query: str) -> Dict[str, Any]:
             if await phone_el.count() > 0:
                 txt = await phone_el.text_content() or await phone_el.get_attribute("aria-label")
                 if txt:
-                    cleaned_phone = re.sub(r"^[^\w\d+]+", "", txt.strip()).strip()
-                    res["phone"] = cleaned_phone
+                    pm = PHONE_RE.search(txt)
+                    if pm and pm.group(1) in VALID_CANADIAN_AREA_CODES:
+                        res["phone"] = f"({pm.group(1)}) {pm.group(2)}-{pm.group(3)}"
 
             # Website element
             web_el = page.locator("a[data-item-id*='authority'], [aria-label*='Website'], [aria-label*='Site Web']").first
@@ -721,8 +735,40 @@ def clean_emails(raw: List[str]) -> List[str]:
     return cleaned
 
 
-def norm_phone(m) -> str:
-    return f"({m.group(1)}) {m.group(2)}-{m.group(3)}"
+def extract_valid_phones(text: str) -> List[str]:
+    if not text:
+        return []
+    res = []
+    seen = set()
+    for m in PHONE_RE.finditer(text):
+        area = m.group(1)
+        if area in VALID_CANADIAN_AREA_CODES:
+            formatted = f"({area}) {m.group(2)}-{m.group(3)}"
+            if formatted not in seen:
+                seen.add(formatted)
+                res.append(formatted)
+    return res
+
+
+def clean_phones(raw: List[str]) -> List[str]:
+    seen, cleaned = set(), []
+    for item in raw:
+        if not item or not isinstance(item, str):
+            continue
+        for p in extract_valid_phones(item):
+            if p not in seen:
+                seen.add(p)
+                cleaned.append(p)
+    return cleaned
+
+
+def norm_phone(m) -> Optional[str]:
+    if not m:
+        return None
+    area = m.group(1)
+    if area not in VALID_CANADIAN_AREA_CODES:
+        return None
+    return f"({area}) {m.group(2)}-{m.group(3)}"
 
 
 NON_NAME_WORDS = {
@@ -768,7 +814,33 @@ NON_NAME_WORDS = {
     # International, diplomatic, and governmental organizations / foreign entities
     "fonds", "international", "internationale", "organisation", "organization", "fmi", "imf",
     "onu", "kosovo", "pristina", "serbie", "albanie", "parlement", "gouvernement",
-    "ministere", "ministère", "republique", "république"
+    "ministere", "ministère", "republique", "république",
+    # Inquiries, demands, orders, generic department keywords
+    "inquiries", "inquiry", "requests", "request", "demandes", "demande", "soumissions",
+    "soumission", "commandes", "commande", "questions", "question", "reponse", "reponses"
+}
+
+DEPARTMENT_WORDS = (
+    "inquir", "inquiry", "inquiries", "request", "demand", "demande", "order", "commande",
+    "service", "support", "billing", "facturation", "sales", "vente", "ventes",
+    "general", "office", "bureau", "career", "careers", "carrieres", "job", "jobs",
+    "media", "press", "marketing", "admin", "info", "contact", "reception", "direction",
+    "rh", "hr", "comptabilite", "accounting", "dispatch", "quote", "quotes", "soumission",
+    "soumissions", "estimation", "customer", "client", "clients", "help", "aide", "urgence",
+    "feedback", "alerte", "alert", "notification", "security", "securite", "webmaster"
+)
+
+COMMON_FIRST_NAMES = {
+    "michel", "paul", "pierre", "jean", "alain", "marc", "luc", "eric", "denis",
+    "serge", "yves", "guy", "francois", "martin", "david", "alexandre", "julien",
+    "simon", "claude", "andre", "stephane", "nicolas", "patrice", "benoit", "sylvain",
+    "mathieu", "sebastien", "guillaume", "christian", "gabriel", "philippe", "vincent",
+    "laurent", "charles", "felix", "samuel", "alex", "louis", "maxime", "dominic",
+    "etienne", "antoine", "olivier", "daniel", "robert", "richard", "bernard", "gilles",
+    "jacques", "rene", "marcel", "rejean", "yvon", "normand", "gaetan", "mario",
+    "bruno", "monique", "nicole", "helene", "louise", "diane", "france",
+    "carole", "lucie", "suzanne", "chantal", "sylvie", "julie", "isabelle", "nathalie",
+    "sophie", "marie", "catherine", "valerie", "genevieve", "stephanie", "melanie"
 }
 
 
@@ -827,25 +899,35 @@ def derive_executive_from_email(email: str, domain: str) -> Optional[Dict[str, s
     if em_domain.lower() != domain.lower():
         return None
     local = local.lower().strip()
-    if any(email.startswith(p) for p in GENERIC_PREFIXES):
+    if any(email.lower().startswith(p) for p in GENERIC_PREFIXES):
         return None
     if any(b in local for b in ("test", "user", "dummy", "sample", "name", "email", "placeholder", "admin", "info")):
         return None
+    if any(w in local for w in DEPARTMENT_WORDS):
+        return None
+
+    # Check if local part is a single known first name (e.g. michel@anipak.ca, paul@bargesmatane.com)
+    if local in COMMON_FIRST_NAMES:
+        return {"name": local.capitalize(), "title": "Direction / Contact Exécutif", "email": email}
 
     # Pattern 1: first.last or first_last or first-last
     m_split = re.match(r"^([a-z]{2,})[._\-]([a-z]{2,})$", local)
     if m_split:
         f_raw, l_raw = m_split.group(1), m_split.group(2)
-        if f_raw not in NON_NAME_WORDS and l_raw not in NON_NAME_WORDS:
+        if (f_raw not in NON_NAME_WORDS and l_raw not in NON_NAME_WORDS and
+            not any(w in f_raw for w in DEPARTMENT_WORDS) and
+            not any(w in l_raw for w in DEPARTMENT_WORDS)):
             full_name = f"{f_raw.capitalize()} {l_raw.capitalize()}"
             return {"name": full_name, "title": "Direction / Contact Exécutif", "email": email}
 
     # Pattern 2: [initial][lastname] (e.g., nriendeau -> N. Riendeau)
     m_init = re.match(r"^([a-z])([a-z]{3,})$", local)
     if m_init:
-        init, surname = m_init.group(1).upper(), m_init.group(2).capitalize()
-        if surname.lower() not in NON_NAME_WORDS and not any(surname.lower().startswith(g.replace("@", "")) for g in GENERIC_PREFIXES):
-            full_name = f"{init}. {surname}"
+        init, surname = m_init.group(1).upper(), m_init.group(2).lower()
+        if (surname not in NON_NAME_WORDS and
+            not any(w in surname for w in DEPARTMENT_WORDS) and
+            not any(surname.startswith(g.replace("@", "")) for g in GENERIC_PREFIXES)):
+            full_name = f"{init}. {surname.capitalize()}"
             return {"name": full_name, "title": "Direction", "email": email}
 
     return None
@@ -898,7 +980,9 @@ def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
             phone = None
             tel_a = card.select_one('a[href^="tel:"]')
             if tel_a:
-                phone = tel_a.get("href", "").replace("tel:", "").strip()
+                phone_raw = tel_a.get("href", "").replace("tel:", "").strip()
+                vp = extract_valid_phones(phone_raw)
+                phone = vp[0] if vp else None
 
             seen.add(norm)
             results.append({
@@ -1384,8 +1468,9 @@ def activity_matches(page_text: str, activity: Optional[str]) -> bool:
 
 
 def company_tokens(name: str) -> List[str]:
-    base = LEGAL_SUFFIX_RE.sub(" ", deaccent(name))
-    return [t for t in re.split(r"[^a-z0-9]+", base) if len(t) >= 4]
+    base = LEGAL_SUFFIX_RE.sub(" ", deaccent(name.lower()))
+    generic = {"quebec", "canada", "services", "groupe", "gestion", "solutions", "holding", "holdings", "entreprise", "entreprises", "cie", "ltee"}
+    return [t for t in re.split(r"[^a-z0-9]+", base) if len(t) >= 4 and t not in generic]
 
 
 def mentions_company(text: str, tokens: List[str], neq: Optional[str], domain: Optional[str]) -> bool:
@@ -1637,6 +1722,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
 
     # 1a. Google Maps Reconnaissance Pass (Place, Verified Address, Business Phone, Official Website)
     maps_query = f"{search_name} {city_str} {body.province or 'Quebec'}".strip()
+    maps_result: Optional[Dict[str, Any]] = None
     try:
         print(f"   🗺️ [MAPS] Reconnaissance: '{maps_query}'...", flush=True)
         maps_result = await _search_google_maps_impl(maps_query)
@@ -1651,7 +1737,8 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                 print(f"      📍 Civic address: {address}", flush=True)
 
             if maps_phone:
-                parsed_phone = norm_phone(PHONE_RE.search(maps_phone)) if PHONE_RE.search(maps_phone) else maps_phone
+                vp = extract_valid_phones(maps_phone)
+                parsed_phone = vp[0] if vp else None
                 if parsed_phone and parsed_phone not in phones:
                     phones.insert(0, parsed_phone)
                     log.append(f"Google Maps: Verified local phone -> {parsed_phone}")
@@ -1733,7 +1820,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                     continue
                 log.append(f"Directory detected: {host} — extracting outbound company links")
                 emails += clean_emails(EMAIL_RE.findall(candidate_html))
-                phones += [norm_phone(m) for m in PHONE_RE.finditer(candidate_text)]
+                phones += extract_valid_phones(candidate_text)
                 people += extract_people_from_markdown(candidate_text)
                 add_raw_source(u, candidate_html,
                     ["directory_listing", "outbound_links", "contact_extraction"],
@@ -1800,7 +1887,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                 if cand_text and (clean_name.lower() in cand_text.lower() or (body.neq and body.neq in cand_text)):
                     add_raw_source(ru, cand_html, ["registry_record", "trade_name_dba", "administrators"], "registry mirror")
                     emails += clean_emails(EMAIL_RE.findall(cand_html))
-                    phones += [norm_phone(m) for m in PHONE_RE.finditer(cand_text)]
+                    phones += extract_valid_phones(cand_text)
                     people += extract_people_from_markdown(cand_text)
                     if not address:
                         addr_m = re.search(r"\b\d+[\w\s,.-]+(?:Québec|Quebec|Montréal|Montreal|Laval|QC)[\w\s,.-]+[A-Z]\d[A-Z]\s*\d[A-Z]\d\b", cand_text)
@@ -1827,12 +1914,15 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
             if not host or "." not in host or any(b in host for b in BAD_HOSTS) or is_directory_host(host):
                 continue
             # CRITICAL: Address hits must verify against the company before ingesting contacts
-            if not trusted_company_page(cand_text, au, company_name, body.neq, host):
+            if not trusted_company_page(cand_text, au, company_name, body.neq, None):
                 log.append(f"Address search candidate {host} skipped: page does not mention company '{company_name}'")
+                continue
+            if not name_matches_host(company_name, input_trade_names, host):
+                log.append(f"Address search candidate {host} skipped: host does not match company '{company_name}'")
                 continue
             add_raw_source(au, cand_html, ["address_fallback_match", "contact_info"], "address search match")
             emails += clean_emails(EMAIL_RE.findall(cand_html))
-            phones += [norm_phone(m) for m in PHONE_RE.finditer(cand_text)]
+            phones += extract_valid_phones(cand_text)
             people += extract_people_from_markdown(cand_text)
             if not domain:
                 domain = host
@@ -1941,7 +2031,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
             emails_found = clean_emails(EMAIL_RE.findall(page_html))
             if emails_found:
                 extraction_summary.append("email_regex")
-            phones_found = [norm_phone(m) for m in PHONE_RE.finditer(markdown_content)]
+            phones_found = extract_valid_phones(markdown_content)
             if phones_found:
                 extraction_summary.append("phone_regex")
 
@@ -2054,7 +2144,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                         emails += social_emails
                         log.append(f"Social {social_key}: Extracted {len(social_emails)} email(s)")
 
-                    social_phones = [norm_phone(m) for m in PHONE_RE.finditer(candidate_text)]
+                    social_phones = extract_valid_phones(candidate_text)
                     if social_phones:
                         phones += social_phones
                         log.append(f"Social {social_key}: Extracted {len(social_phones)} phone(s)")
@@ -2121,7 +2211,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                 txt = clean_html_to_markdown(html_content)
 
                 emails_in_page = EMAIL_RE.findall(txt)
-                phones_in_page = [norm_phone(m) for m in PHONE_RE.finditer(txt)]
+                phones_in_page = extract_valid_phones(txt)
                 add_raw_source(
                     u, html_content,
                     ["custom_site_emails", "custom_site_phones", "contact_forms"],
@@ -2158,7 +2248,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                     log.append(f"Derived executive contact from email {em}: {derived['name']}")
 
     emails = exec_emails + generic_emails
-    phones = list(dict.fromkeys(phones))[:5]
+    phones = clean_phones(phones)[:5]
     verified_mx = {e: mx_ok(e.split("@")[-1]) for e in emails[:10]}
 
     # 8. Reverse Cross-Check Engine
@@ -2174,7 +2264,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
     # For emails directly on the verified corporate domain, they are authoritative from the site.
     # Only reverse cross-check external emails and phones across search engines.
     to_check_emails = [e for e in emails if not (domain and e.endswith("@" + domain))][:2]
-    maps_phone = maps_info.get("phone") if isinstance(maps_info, dict) else None
+    maps_phone = maps_result.get("phone") if isinstance(maps_result, dict) else None
     to_check_phones = [p for p in phones if p != maps_phone][:1]
 
     checks = await asyncio.gather(

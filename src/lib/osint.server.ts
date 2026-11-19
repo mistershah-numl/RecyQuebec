@@ -181,6 +181,24 @@ function nameMatchesHost(token: string, host: string, originalName?: string): bo
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const PHONE_RE = /(?:\+?1[\s.-]?)?\(?([2-9]\d{2})\)?[\s.-]?(\d{3})[\s.-]?(\d{4})/g;
 
+const VALID_CANADIAN_AREA_CODES = new Set([
+  "418", "581", "367", "450", "579", "514", "438", "819", "873",
+  "800", "888", "877", "866", "855", "844", "833",
+  "204", "226", "236", "249", "250", "289", "306", "343", "403",
+  "416", "431", "506", "519", "587", "604", "613", "639", "647",
+  "705", "709", "778", "780", "782", "807", "825", "867", "902", "905",
+]);
+
+function formatValidCanadianPhone(p: string): string | null {
+  if (!p) return null;
+  const digits = p.replace(/\D/g, "");
+  const num = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+  if (num.length !== 10) return null;
+  const area = num.slice(0, 3);
+  if (!VALID_CANADIAN_AREA_CODES.has(area)) return null;
+  return `(${area}) ${num.slice(3, 6)}-${num.slice(6)}`;
+}
+
 const TITLE_WORDS =
   "(?:pr[ée]sident(?:e)?(?:[- ]directeur[- ]g[ée]n[ée]ral)?|vice[- ]pr[ée]sident(?:e)?|" +
   "direct(?:eur|rice)(?:\\s+g[ée]n[ée]ral(?:e)?|\\s+d'[ée]tudes|\\s+des\\s+[ée]tudes)?|" +
@@ -533,7 +551,12 @@ export async function workerOsint(input: {
     return {
       emails: sanitizeEmailList(d.emails ?? []).slice(0, 60),
       trustedEmails: sanitizeEmailList(d.trusted_emails ?? []).slice(0, 20),
-      phones: (d.phones ?? []).filter((e) => typeof e === "string").slice(0, 40),
+      phones: (d.phones ?? [])
+        .filter((e): e is string => typeof e === "string")
+        .map((p) => formatValidCanadianPhone(p))
+        .filter((p): p is string => Boolean(p))
+        .filter((p, i, arr) => arr.indexOf(p) === i)
+        .slice(0, 10),
       people: (d.people ?? [])
         .filter((p) => p && typeof p.name === "string")
         .map((p) => ({ name: p.name, title: p.title ?? "" }))
@@ -850,9 +873,18 @@ function collectEmails(text: string, domainHint: string | null, companyName?: st
 }
 
 function collectPhones(text: string): string[] {
-  return Array.from(
-    new Set((text.match(PHONE_RE) ?? []).map((p) => p.replace(/\s+/g, " ").trim())),
-  ).slice(0, 4);
+  if (!text) return [];
+  const matches = text.match(PHONE_RE) ?? [];
+  const res: string[] = [];
+  const seen = new Set<string>();
+  for (const m of matches) {
+    const formatted = formatValidCanadianPhone(m);
+    if (formatted && !seen.has(formatted)) {
+      seen.add(formatted);
+      res.push(formatted);
+    }
+  }
+  return res.slice(0, 4);
 }
 
 const NON_NAME_WORDS = new Set([
@@ -895,7 +927,10 @@ const NON_NAME_WORDS = new Set([
   // International, diplomatic, and governmental organizations / titles
   "fonds", "international", "internationale", "organisation", "organization", "fmi", "imf",
   "onu", "kosovo", "pristina", "serbie", "albanie", "parlement", "gouvernement",
-  "ministere", "ministère", "republique", "république"
+  "ministere", "ministère", "republique", "république",
+  // Department, inquiry, and order keywords
+  "inquiries", "inquiry", "requests", "request", "demandes", "demande", "soumissions",
+  "soumission", "commandes", "commande", "questions", "question"
 ]);
 
 export function isInstitutionalName(name: string): boolean {
