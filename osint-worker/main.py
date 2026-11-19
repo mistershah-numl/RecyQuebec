@@ -1,5 +1,5 @@
 """
-RECYC-Contact-OSINT — Local Worker Engine (Windows / VS Code / Production Ready)
+RECYC-Contact-OSINT — Local & VPS Worker Engine (Windows / Linux / Colab / Production Ready)
 
 Endpoints:
   GET  /            -> health & statistics
@@ -11,15 +11,11 @@ Endpoints:
   POST /smtp/send   -> send one email through the configured SMTP server
 
 Run:
-  py -3.12 -m venv .venv
-  .\\.venv\\Scripts\\Activate.ps1
-  pip install -r requirements.txt html2text
-  python -m playwright install chromium
-  $env:WORKER_SECRET="shah"
   uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -70,6 +66,7 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+UA_SEARCH = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:\+?1[\s.\-]?)?\(?([2-9]\d{2})\)?[\s.\-]?(\d{3})[\s.\-]?(\d{4})")
@@ -97,7 +94,6 @@ BAD_EMAIL_HINTS = (
 BAD_HOSTS = ("duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com")
 
 # Directory / review portals — never accept these as a company's official domain.
-# Instead, scrape them for outbound links that may point to the real company website.
 DIRECTORY_DOMAINS = (
     "restaurantguru.com", "yelp.com", "yelp.ca", "tripadvisor.com", "tripadvisor.ca",
     "yellowpages.ca", "pagesjaunes.ca", "canada411.ca", "goldbook.ca", "411.ca",
@@ -150,7 +146,6 @@ def name_matches_host(company_name: str, trade_names: List[str], host: str) -> b
             return True
         if base in token or token in flat:
             return True
-        # Partial head match (at least 5 chars)
         head = token[:max(5, min(8, len(token)))]
         if base.startswith(head) or head.startswith(base[:6]):
             return True
@@ -171,7 +166,6 @@ def extract_outbound_company_links(html: str, company_name: str, trade_names: Li
         host = urlparse(href).netloc.lower().replace("www.", "")
         if not host or "." not in host:
             continue
-        # Skip links pointing back to the directory itself or social/search
         if is_directory_host(host) or any(b in host for b in BAD_HOSTS):
             continue
         if any(s in host for s in ("facebook.com", "linkedin.com", "instagram.com", "twitter.com", "x.com", "youtube.com")):
@@ -180,6 +174,7 @@ def extract_outbound_company_links(html: str, company_name: str, trade_names: Li
             if href not in outbound:
                 outbound.append(href)
     return outbound[:5]
+
 
 # Optional Stealth integration
 try:
@@ -192,38 +187,6 @@ except Exception:
         from playwright_stealth import stealth_async as _STEALTH_V1
     except Exception:
         _STEALTH_V1 = None
-
-
-# ---------------------------------------------------------------- Playwright Proactor Thread Runner
-class PlaywrightLoopThread:
-    """Dedicated background thread running a Windows ProactorEventLoop for Playwright."""
-    def __init__(self):
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.thread: Optional[threading.Thread] = None
-
-    def start(self):
-        if self.thread is not None and self.thread.is_alive():
-            return
-        ready_event = threading.Event()
-
-        def _worker():
-            if sys.platform == "win32":
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            ready_event.set()
-            self.loop.run_forever()
-
-        self.thread = threading.Thread(target=_worker, daemon=True, name="PlaywrightProactorThread")
-        self.thread.start()
-        ready_event.wait()
-
-    def run_coro(self, coro):
-        self.start()
-        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return asyncio.wrap_future(future)
-
-pw_thread = PlaywrightLoopThread()
 
 
 # ---------------------------------------------------------------- Lifecycle & Server
@@ -281,18 +244,23 @@ async def lifespan(app: FastAPI):
 
     loop.set_exception_handler(_playwright_exception_handler)
 
-    pw_thread.start()
-    with suppress(Exception):
-        pw_thread.run_coro(ensure_browser(app))
+    try:
+        await ensure_browser(app)
+        print("🚀 [STARTUP] Playwright Chromium browser initialized successfully.", flush=True)
+    except Exception as e:
+        print(f"⚠️ [STARTUP] Warning: Playwright pre-launch warning ({e}). Will attempt on demand.", flush=True)
+
+    print(f"🌟 [WORKER ONLINE] Auth secret: {'enabled' if WORKER_SECRET else 'none'}", flush=True)
+    print(f"   Max browser workers: {MAX_BROWSER_PAGES} | Render timeout: {RENDER_TIMEOUT}s | OSINT timeout: {OSINT_TIMEOUT}s\n", flush=True)
 
     yield
 
     if app.state.browser:
         with suppress(Exception):
-            pw_thread.run_coro(app.state.browser.close())
+            await app.state.browser.close()
     if getattr(app.state, "pw", None):
         with suppress(Exception):
-            pw_thread.run_coro(app.state.pw.stop())
+            await app.state.pw.stop()
 
 
 app = FastAPI(title="RECYC-Contact-OSINT Worker", lifespan=lifespan)
@@ -339,11 +307,25 @@ class RenderIn(BaseModel):
 async def render(body: RenderIn, x_worker_secret: Optional[str] = Header(None)):
     verify_auth(x_worker_secret)
     app.state.stats["queued"] += 1
+    t0 = time.time()
+    print(f"🌐 [RENDER] Request received for: {body.url[:90]}", flush=True)
     try:
-        return await asyncio.wait_for(pw_thread.run_coro(_render_impl(body)), timeout=RENDER_TIMEOUT)
+        res = await asyncio.wait_for(_render_impl(body), timeout=RENDER_TIMEOUT)
+        dur = round((time.time() - t0) * 1000)
+        if res.get("ok"):
+            html_len = len(res.get("html", ""))
+            print(f"✅ [RENDER] Success: {body.url[:70]} ({html_len:,} chars in {dur}ms)", flush=True)
+        else:
+            print(f"⚠️ [RENDER] Failed: {body.url[:70]} -> {res.get('error')}", flush=True)
+        return res
     except asyncio.TimeoutError:
         app.state.stats["failed"] += 1
+        print(f"⏱️ [RENDER] Timeout after {RENDER_TIMEOUT}s for: {body.url[:70]}", flush=True)
         return {"ok": False, "status": 0, "url": body.url, "error": f"render deadline exceeded ({RENDER_TIMEOUT}s)", "html": "", "text": ""}
+    except Exception as e:
+        app.state.stats["failed"] += 1
+        print(f"❌ [RENDER] Exception for {body.url[:70]}: {e}", flush=True)
+        return {"ok": False, "status": 0, "url": body.url, "error": str(e), "html": "", "text": ""}
     finally:
         app.state.stats["queued"] = max(0, app.state.stats["queued"] - 1)
 
@@ -462,26 +444,44 @@ async def _search_google_maps_impl(query: str) -> Dict[str, Any]:
             await page.route("**/*", _block_media)
             url = f"https://www.google.com/maps/search/{quote_plus(query)}/"
             await page.goto(url, wait_until="domcontentloaded", timeout=14000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(2500)
+
+            # Dismiss Google consent dialog if present
+            for consent_sel in [
+                "button[aria-label*='Tout refuser']", "button[aria-label*='Reject all']",
+                "button:has-text('Tout refuser')", "button:has-text('Reject all')",
+                "button[aria-label*='Tout accepter']", "button[aria-label*='Accept all']",
+                "button:has-text('Tout accepter')", "button:has-text('J\'accepte')",
+            ]:
+                try:
+                    c_btn = page.locator(consent_sel).first
+                    if await c_btn.count() > 0 and await c_btn.is_visible():
+                        await c_btn.click(timeout=1500)
+                        await page.wait_for_timeout(500)
+                        break
+                except Exception:
+                    pass
 
             res: Dict[str, Any] = {"address": None, "phone": None, "website": None, "title": None, "html": ""}
 
             title = (await page.title()) or ""
-            res["title"] = title.replace(" - Google Maps", "").strip()
+            res["title"] = title.replace(" - Google Maps", "").replace(" - Google Maps", "").strip()
 
             # Address element
             addr_el = page.locator("button[data-item-id*='address'], [aria-label*='Address'], [aria-label*='Adresse']").first
             if await addr_el.count() > 0:
                 txt = await addr_el.text_content() or await addr_el.get_attribute("aria-label")
                 if txt:
-                    res["address"] = txt.strip().replace("", "").strip()
+                    cleaned_addr = re.sub(r"^[^\w\d]+", "", txt.strip()).strip()
+                    res["address"] = cleaned_addr
 
             # Phone element
             phone_el = page.locator("button[data-item-id*='phone'], [aria-label*='Phone'], [aria-label*='Téléphone']").first
             if await phone_el.count() > 0:
                 txt = await phone_el.text_content() or await phone_el.get_attribute("aria-label")
                 if txt:
-                    res["phone"] = txt.strip().replace("", "").strip()
+                    cleaned_phone = re.sub(r"^[^\w\d+]+", "", txt.strip()).strip()
+                    res["phone"] = cleaned_phone
 
             # Website element
             web_el = page.locator("a[data-item-id*='authority'], [aria-label*='Website'], [aria-label*='Site Web']").first
@@ -607,7 +607,10 @@ NON_NAME_WORDS = {
     "clinique", "dentaire", "centre", "cabinet", "bureau", "conseil", "administration", "gouvernance",
     "direction", "membres", "personnel", "staff", "denturologiste", "hygiéniste", "hygieniste",
     "assistante", "assistant", "réceptionniste", "receptionniste", "infirmier", "infirmière",
-    "technicien", "technicienne",
+    "technicien", "technicienne", "microsoft", "windows", "edge", "teams", "safari", "chrome",
+    "firefox", "browser", "apple", "google", "android", "ios", "adobe", "linux", "ubuntu",
+    "login", "signin", "signup", "subscribe", "newsletter", "feedback", "support", "help",
+    "careers", "jobs", "press", "media", "news",
 }
 
 
@@ -658,7 +661,6 @@ def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
         ]
         card_nodes = soup.select(", ".join(selectors))
         for card in card_nodes:
-            # First heading in the card is usually the person's name
             heading = card.find(["h1", "h2", "h3", "h4", "h5", "h6", "strong"])
             cand_raw = heading.get_text(strip=True) if heading else ""
             if not cand_raw:
@@ -672,7 +674,6 @@ def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
             if norm in seen:
                 continue
 
-            # Look for an executive/professional title inside the card
             card_text = card.get_text(" ", strip=True)
             m_t = EXEC_TITLE_RE.search(card_text)
             title = m_t.group(0).strip() if m_t else "Executive"
@@ -726,7 +727,6 @@ def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
             if "@" not in cleaned_email or "." not in cleaned_email:
                 continue
 
-            # Look up to 3 parent elements for a person name heading
             curr = mail_a.parent
             for _ in range(3):
                 if not curr:
@@ -736,7 +736,6 @@ def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
                     h_clean = clean_person_name(heading.get_text(strip=True))
                     if is_valid_person_name(h_clean):
                         h_norm = h_clean.lower()
-                        # If already in results without email, update email
                         existing = next((r for r in results if r["name"].lower() == h_norm), None)
                         if existing and not existing.get("email"):
                             existing["email"] = cleaned_email
@@ -820,7 +819,6 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
                     if is_valid_person_name(cand_clean) and cand_clean.lower() != clean_norm:
                         break
 
-                # Also check if title was directly in the line itself (e.g. [Dr Anthony MikhayelDentiste](/staff/...))
                 if not matched_title:
                     m_same = title_sub_re.search(line)
                     if m_same:
@@ -914,8 +912,8 @@ async def harvester_passive_discovery(domain: str, company_name: str) -> Tuple[L
     discovered_emails: List[str] = []
     discovered_subdomains: List[str] = []
 
-    dork_query = quote_plus(f'site:{domain} "@{domain}"')
-    dork_urls = await search(f"https://duckduckgo.com/html/?q={dork_query}", lambda h: not any(b in h for b in BAD_HOSTS))
+    dork_query = f'site:{domain} "@{domain}"'
+    dork_urls = await search(dork_query, lambda h: not any(b in h for b in BAD_HOSTS))
     for url in dork_urls[:3]:
         r = await fetch_text(url, allow_browser=False)
         discovered_emails += EMAIL_RE.findall(r["html"])
@@ -960,23 +958,64 @@ def generate_candidate_permutations(exec_name: str, domain: str) -> List[str]:
     ]
 
 
+def decode_bing_u(u_val: str) -> Optional[str]:
+    """Decodes Bing redirect parameter u=a1<base64> into direct destination URL."""
+    if u_val.startswith("a1"):
+        b64 = u_val[2:] + "=" * ((4 - len(u_val[2:]) % 4) % 4)
+        try:
+            return base64.urlsafe_b64decode(b64).decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+    return None
+
+
 def _extract_search_links(html: str, link_filter=None) -> List[str]:
+    """Extracts and unmasks destination URLs from search engine result pages."""
     if not html:
         return []
     soup = BeautifulSoup(html, "html.parser")
     links: List[str] = []
     for a in soup.select("a[href]"):
-        href = a["href"]
-        if "//duckduckgo.com/l/?uddg=" in href:
+        href = a["href"].strip()
+
+        # 1. DuckDuckGo redirect
+        if "duckduckgo.com/l/?uddg=" in href or "/l/?uddg=" in href:
             full = "https:" + href if href.startswith("//") else href
-            href = unquote(parse_qs(urlparse(full).query).get("uddg", [""])[0])
+            uddg = parse_qs(urlparse(full).query).get("uddg", [""])[0]
+            if uddg:
+                href = unquote(uddg)
+
+        # 2. Bing redirect /ck/a carrying u=a1<base64>
+        elif "bing.com/ck/a" in href:
+            qs = parse_qs(urlparse(href).query)
+            u = qs.get("u", [""])[0]
+            if u:
+                dec = decode_bing_u(u)
+                if dec:
+                    href = dec
+
+        # 3. Yahoo redirect
         elif "/r.search.yahoo.com/" in href or "/RU=" in href:
             m = re.search(r"/RU=([^/]+)/", href)
             if m:
                 href = unquote(m.group(1))
+
+        # 4. Google redirect
+        elif "google." in href and "/url?" in href:
+            qs = parse_qs(urlparse(href).query)
+            g_url = qs.get("url", [""])[0] or qs.get("q", [""])[0]
+            if g_url:
+                href = unquote(g_url)
+
         if not href.startswith("http"):
             continue
-        if any(h in href for h in BAD_HOSTS):
+
+        host = urlparse(href).netloc.lower().replace("www.", "")
+        if not host or "." not in host:
+            continue
+        if any(b in host for b in BAD_HOSTS):
+            continue
+        if host in ("bing.com", "microsoft.com", "yahoo.com", "duckduckgo.com", "google.com"):
             continue
         if link_filter and not link_filter(href):
             continue
@@ -985,36 +1024,75 @@ def _extract_search_links(html: str, link_filter=None) -> List[str]:
     return links[:25]
 
 
-async def search(engine_url: str, link_filter=None, allow_browser: bool = True) -> List[str]:
-    # Extract search query from engine_url if present
-    parsed = urlparse(engine_url)
+async def search(query_or_url: str, link_filter=None, allow_browser: bool = True) -> List[str]:
+    """Multi-engine search querying DuckDuckGo, Bing, and Yahoo with automatic failover."""
+    parsed = urlparse(query_or_url)
     qs = parse_qs(parsed.query)
     q = qs.get("q", [""])[0] or qs.get("p", [""])[0]
+    if not q and not query_or_url.startswith("http"):
+        q = query_or_url
 
-    # 1. First try DuckDuckGo Lite via POST (fastest, unblocked 200ms)
-    if q:
+    clean_q = q or query_or_url
+    results: List[str] = []
+
+    # 1. DuckDuckGo HTML endpoint with clean Firefox User-Agent (avoids 202 challenge)
+    ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(clean_q)}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=8, follow_redirects=True,
+            headers={"User-Agent": UA_SEARCH, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
+        ) as client:
+            r = await client.get(ddg_url)
+            if r.status_code == 200:
+                for l in _extract_search_links(r.text, link_filter):
+                    if l not in results:
+                        results.append(l)
+    except Exception:
+        pass
+
+    # 2. Bing endpoint (essential fallback for Canadian index coverage)
+    if len(results) < 5:
+        bing_url = f"https://www.bing.com/search?q={quote_plus(clean_q)}&cc=CA&setlang=fr"
         try:
             async with httpx.AsyncClient(
                 timeout=8, follow_redirects=True,
                 headers={"User-Agent": UA, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
             ) as client:
-                r = await client.post("https://lite.duckduckgo.com/lite/", data={"q": q})
+                r = await client.get(bing_url)
                 if r.status_code == 200:
-                    links = _extract_search_links(r.text, link_filter)
-                    if links:
-                        return links[:25]
+                    for l in _extract_search_links(r.text, link_filter):
+                        if l not in results:
+                            results.append(l)
         except Exception:
             pass
 
-    # 2. Direct HTTP GET
-    page = await fetch_text(engine_url, allow_browser=False)
-    links = _extract_search_links(page.get("html", ""), link_filter)
+    # 3. Yahoo endpoint
+    if len(results) < 5:
+        yahoo_url = f"https://ca.search.yahoo.com/search?p={quote_plus(clean_q)}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=8, follow_redirects=True,
+                headers={"User-Agent": UA, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
+            ) as client:
+                r = await client.get(yahoo_url)
+                if r.status_code == 200:
+                    for l in _extract_search_links(r.text, link_filter):
+                        if l not in results:
+                            results.append(l)
+        except Exception:
+            pass
 
-    # 3. Browser fallback with Playwright
-    if not links and allow_browser:
-        page = await fetch_text(engine_url, wait_ms=1200, allow_browser=True)
-        links = _extract_search_links(page.get("html", ""), link_filter)
-    return links[:25]
+    # 4. Playwright Browser fallback if still empty
+    if not results and allow_browser:
+        try:
+            page = await fetch_text(ddg_url, wait_ms=1200, allow_browser=True)
+            for l in _extract_search_links(page.get("html", ""), link_filter):
+                if l not in results:
+                    results.append(l)
+        except Exception:
+            pass
+
+    return results[:25]
 
 
 def activity_matches(page_text: str, activity: Optional[str]) -> bool:
@@ -1074,10 +1152,7 @@ async def reverse_check(value: str, kind: str, company: str, neq: Optional[str],
     links: List[str] = []
     for q in queries:
         try:
-            hits = await search(
-                f"https://duckduckgo.com/html/?q={quote_plus(q)}",
-                lambda h: not any(b in h for b in BAD_HOSTS),
-            )
+            hits = await search(q, lambda h: not any(b in h for b in BAD_HOSTS))
             for h in hits:
                 if h not in links:
                     links.append(h)
@@ -1132,9 +1207,11 @@ class VerifyIn(BaseModel):
 @app.post("/verify")
 async def verify(body: VerifyIn, x_worker_secret: Optional[str] = Header(None)):
     verify_auth(x_worker_secret)
+    print(f"🔍 [VERIFY] Checking {body.kind}: '{body.value}' for '{body.company}'", flush=True)
     result = await reverse_check(body.value, body.kind, body.company, body.neq, body.domain)
     if body.kind == "email" and "@" in body.value:
         result["mx"] = mx_ok(body.value.split("@")[-1])
+    print(f"   [VERIFY] Result: matched={result.get('matched')} (confirmations={result.get('confirmations')})", flush=True)
     return {"ok": True, **result}
 
 
@@ -1153,24 +1230,52 @@ class OsintIn(BaseModel):
     extra_sites: List[str] = []
     sites: List[str] = []
     max_pages: int = 35
-    # REQ economic activity description (e.g. "Fourniture de services informatiques")
     activity: Optional[str] = None
-    # Active trade names / DBA from REQ (e.g. ["NETTOYEUR INDUSTRIEL PRO/MAX"])
     trade_names: List[str] = []
 
 
 @app.post("/osint")
 async def osint(body: OsintIn, x_worker_secret: Optional[str] = Header(None)):
     verify_auth(x_worker_secret)
+    cname = body.company or body.company_name or "Unknown Company"
+    print(f"\n{'='*70}", flush=True)
+    print(f"🚀 [OSINT] Starting full reconnaissance for: '{cname}'", flush=True)
+    if body.neq:
+        print(f"   📋 NEQ: {body.neq} | City: {body.city or 'N/A'} | Province: {body.province or 'Quebec'}", flush=True)
+    t0 = time.time()
     try:
-        return await asyncio.wait_for(_osint_impl(body), timeout=OSINT_TIMEOUT)
+        res = await asyncio.wait_for(_osint_impl(body), timeout=OSINT_TIMEOUT)
+        dur = round(time.time() - t0, 1)
+        dom = res.get("domain") or "None"
+        num_emails = len(res.get("emails", []))
+        num_people = len(res.get("people", []))
+        num_phones = len(res.get("phones", []))
+        print(f"✨ [OSINT] Completed for '{cname}' in {dur}s:", flush=True)
+        print(f"   🌐 Domain: {dom}", flush=True)
+        print(f"   👥 Executives: {num_people} found", flush=True)
+        for p in res.get("people", [])[:4]:
+            print(f"      * {p.get('name')} ({p.get('title')}) -> {p.get('email') or 'no email'}", flush=True)
+        print(f"   📧 Emails: {num_emails} found -> {', '.join(res.get('emails', [])[:3])}", flush=True)
+        print(f"   📞 Phones: {num_phones} found -> {', '.join(res.get('phones', [])[:2])}", flush=True)
+        print(f"{'='*70}\n", flush=True)
+        return res
     except asyncio.TimeoutError:
         app.state.stats["failed"] += 1
+        print(f"⏱️ [OSINT] Timeout after {OSINT_TIMEOUT}s for: '{cname}'\n{'='*70}\n", flush=True)
         return {
             "ok": False,
             "error": f"company deadline exceeded ({OSINT_TIMEOUT}s)",
             "emails": [], "phones": [], "people": [], "socials": {},
             "log": ["worker deadline reached; app will retry this company"],
+        }
+    except Exception as e:
+        app.state.stats["failed"] += 1
+        print(f"❌ [OSINT] Internal error for '{cname}': {e}\n{'='*70}\n", flush=True)
+        return {
+            "ok": False,
+            "error": str(e),
+            "emails": [], "phones": [], "people": [], "socials": {},
+            "log": [f"worker internal error: {e}"],
         }
 
 
@@ -1191,7 +1296,6 @@ async def _osint_impl(body: OsintIn):
     input_activity = (body.activity or "").strip()
     input_trade_names = [t.strip() for t in (body.trade_names or []) if t.strip()]
     browser_budget = MAX_OSINT_BROWSER_FALLBACKS
-    # Track raw execution data for frontend "pre-record activity" display
     raw_execution_sources: List[Dict[str, Any]] = []
 
     async def osint_fetch(url: str, wait_ms: int = 900) -> Dict[str, str]:
@@ -1203,18 +1307,16 @@ async def _osint_impl(body: OsintIn):
         return await fetch_text(url, wait_ms=wait_ms, allow_browser=True)
 
     def add_raw_source(url: str, html: str, extraction_points: List[str], selector: str = ""):
-        """Log raw HTML/JS source info for data extraction provenance."""
         source_info = {
             "url": url,
             "selector": selector or "general",
-            "extraction_points": extraction_points[:5],  # Limit to top 5 points
+            "extraction_points": extraction_points[:5],
             "html_preview": html[:2000] if html else "",
         }
         raw_execution_sources.append(source_info)
         log.append(f"[RAW] Source: {url} - Extraction points: {', '.join(extraction_points[:3])}")
 
     clean_name = LEGAL_SUFFIX_RE.sub("", company_name).strip()
-    # Use first trade name as search alias if available (numbered companies)
     search_name = input_trade_names[0] if input_trade_names else clean_name
     city_str = body.city or ""
     q_base = f'"{search_name}" {city_str} {body.province or ""} {body.country or ""}'.strip()
@@ -1222,7 +1324,8 @@ async def _osint_impl(body: OsintIn):
     # 1a. Google Maps Reconnaissance Pass (Place, Verified Address, Business Phone, Official Website)
     maps_query = f"{search_name} {city_str} {body.province or 'Quebec'}".strip()
     try:
-        maps_result = await pw_thread.run_coro(_search_google_maps_impl(maps_query))
+        print(f"   🗺️ [MAPS] Reconnaissance: '{maps_query}'...", flush=True)
+        maps_result = await _search_google_maps_impl(maps_query)
         if maps_result:
             maps_addr = maps_result.get("address")
             maps_phone = maps_result.get("phone")
@@ -1231,18 +1334,21 @@ async def _osint_impl(body: OsintIn):
             if maps_addr and not address:
                 address = maps_addr
                 log.append(f"Google Maps: Verified civic address -> {address}")
+                print(f"      📍 Civic address: {address}", flush=True)
 
             if maps_phone:
                 parsed_phone = norm_phone(PHONE_RE.search(maps_phone)) if PHONE_RE.search(maps_phone) else maps_phone
                 if parsed_phone and parsed_phone not in phones:
                     phones.insert(0, parsed_phone)
                     log.append(f"Google Maps: Verified local phone -> {parsed_phone}")
+                    print(f"      📞 Business phone: {parsed_phone}", flush=True)
 
             if maps_web and not domain:
                 maps_host = urlparse(maps_web).netloc.lower().replace("www.", "")
                 if maps_host and not is_directory_host(maps_host) and name_matches_host(company_name, input_trade_names, maps_host):
                     domain = maps_host
                     log.append(f"Google Maps: Discovered official domain -> {domain}")
+                    print(f"      🌐 Discovered domain: {domain}", flush=True)
 
             if maps_result.get("html"):
                 add_raw_source(
@@ -1258,83 +1364,75 @@ async def _osint_impl(body: OsintIn):
     # 1. Official Domain Discovery (with directory-trap protection)
     if not domain:
         log.append(f"Searching official domain for '{search_name}'")
-        search_candidates = [
-            f"https://duckduckgo.com/html/?q={quote_plus(q_base + ' site officiel OR official website')}",
-            f"https://ca.search.yahoo.com/search?p={quote_plus(search_name + ' ' + city_str + ' Quebec contact courriel')}",
-            f"https://ca.search.yahoo.com/search?p={quote_plus(search_name + ' site officiel')}",
+        print(f"   🔍 [SEARCH] Searching official domain for '{search_name}'...", flush=True)
+        search_queries = [
+            f"{search_name} {city_str} Quebec site officiel",
+            f'"{search_name}" {city_str} contact courriel',
+            f"{search_name} Quebec official website",
         ]
-        # Also search by trade names if the main name is a numbered corp
         if input_trade_names and input_trade_names[0] != clean_name:
-            search_candidates.insert(0,
-                f"https://duckduckgo.com/html/?q={quote_plus(input_trade_names[0] + ' ' + city_str + ' Quebec site officiel')}"
-            )
+            search_queries.insert(0, f"{input_trade_names[0]} {city_str} Quebec site officiel")
+
         urls = []
-        for s_url in search_candidates:
+        for sq in search_queries:
             urls = await search(
-                s_url,
+                sq,
                 lambda h: not any(s in h for s in (*BAD_HOSTS, "facebook.com", "linkedin.com", "yellowpages.ca")),
                 allow_browser=True,
             )
             if urls:
                 break
+
         for u in urls[:6]:
             host = urlparse(u).netloc.lower().replace("www.", "")
             candidate_page = await osint_fetch(u, wait_ms=500)
             candidate_html = unmask_cloudflare_emails(candidate_page["html"])
             candidate_text = clean_html_to_markdown(candidate_html)
 
-            # Check economic activity match if REQ activity was provided
             if input_activity and not activity_matches(candidate_text, input_activity):
                 log.append(f"Domain candidate {host} skipped: does not match economic activity '{input_activity}'")
                 continue
 
-            # --- DIRECTORY TRAP: If this is a directory portal, do NOT adopt its
-            # domain. Instead, extract outbound links that may point to the real
-            # company website and mine the directory page for contact data. ---
+            # Directory Trap: Extract outbound links
             if is_directory_host(host):
                 log.append(f"Directory detected: {host} — extracting outbound company links")
-                # Mine directory listing for emails/phones/people
                 emails += clean_emails(EMAIL_RE.findall(candidate_html))
                 phones += [norm_phone(m) for m in PHONE_RE.finditer(candidate_text)]
                 people += extract_people_from_markdown(candidate_text)
                 add_raw_source(u, candidate_html,
                     ["directory_listing", "outbound_links", "contact_extraction"],
                     f"directory:{host}")
-                # Follow outbound links to the real company site
-                outbound = extract_outbound_company_links(
-                    candidate_html, company_name, input_trade_names)
+
+                outbound = extract_outbound_company_links(candidate_html, company_name, input_trade_names)
                 for ob_url in outbound:
                     ob_host = urlparse(ob_url).netloc.lower().replace("www.", "")
                     if is_directory_host(ob_host):
                         continue
                     ob_page = await osint_fetch(ob_url, wait_ms=600)
                     ob_text = clean_html_to_markdown(ob_page["html"])
-                    # Validate: must be Canadian, not a foreign lookalike
                     if FOREIGN_LOCATION_RE.search(ob_text) and not CANADA_RE.search(ob_text):
                         log.append(f"Rejected foreign domain from directory link: {ob_host}")
                         continue
                     domain = ob_host
                     log.append(f"Domain extracted from directory outbound link: {domain}")
+                    print(f"      🌐 Domain from directory outbound: {domain}", flush=True)
                     add_raw_source(ob_url, ob_page["html"],
                         ["domain_verification", "directory_outbound"],
                         "directory extracted domain")
                     break
-                continue  # Don't adopt the directory host as domain
+                continue
 
-            # --- FOREIGN LOOKALIKE CHECK: Reject domains whose pages show
-            # foreign evidence (France, Belgium, etc.) without Canadian markers ---
+            # Canadian domain validation
             if host and "." in host and trusted_company_page(candidate_text, u, company_name, body.neq, None):
-                # Additional foreign-evidence check on the domain's own page
                 if FOREIGN_LOCATION_RE.search(candidate_text) and not CANADA_RE.search(candidate_text):
-                    log.append(f"Rejected foreign lookalike domain: {host} (foreign location markers, no Canadian evidence)")
+                    log.append(f"Rejected foreign lookalike domain: {host}")
                     continue
-                # Also reject if the host doesn't plausibly match the company name
                 if not name_matches_host(company_name, input_trade_names, host):
-                    log.append(f"Rejected unrelated domain: {host} (hostname does not match company)")
+                    log.append(f"Rejected unrelated domain: {host}")
                     continue
                 domain = host
                 log.append(f"Validated Canadian domain: {domain}")
-                # Log raw HTML source for domain page
+                print(f"      🌐 Validated domain: {domain}", flush=True)
                 add_raw_source(
                     u, candidate_html,
                     ["domain_verification", "company_mention"],
@@ -1348,8 +1446,8 @@ async def _osint_impl(body: OsintIn):
         if is_numbered:
             log.append(f"Numbered corporation detected: querying Canadian business registry records for '{clean_name}'")
         reg_queries = [
-            f"https://ca.search.yahoo.com/search?p={quote_plus(clean_name + ' Quebec registre entreprises OR can1business OR opengovca')}",
-            f"https://duckduckgo.com/html/?q={quote_plus(clean_name + ' Quebec registre entreprises')}",
+            f"{clean_name} Quebec registre entreprises",
+            f"{clean_name} can1business",
         ]
         for rq in reg_queries:
             r_urls = await search(
@@ -1379,7 +1477,7 @@ async def _osint_impl(body: OsintIn):
         log.append(f"Searching by address: '{search_addr}'")
         addr_q = f'"{search_addr}" {city_str} Quebec contact courriel'
         addr_urls = await search(
-            f"https://ca.search.yahoo.com/search?p={quote_plus(addr_q)}",
+            addr_q,
             lambda h: not any(s in h for s in (*BAD_HOSTS, "facebook.com", "linkedin.com")),
             allow_browser=True,
         )
@@ -1398,14 +1496,13 @@ async def _osint_impl(body: OsintIn):
                     log.append(f"Domain discovered via address search: {domain}")
                     break
 
-    # 1d. Final foreign-lookalike guard: if we chose a domain, verify its homepage
-    # is not from a foreign country with the same company name.
+    # 1d. Final foreign-lookalike guard
     if domain and not is_directory_host(domain):
         try:
             verify_page = await osint_fetch(f"https://{domain}", wait_ms=600)
             verify_text = clean_html_to_markdown(verify_page["html"])
             if FOREIGN_LOCATION_RE.search(verify_text) and not CANADA_RE.search(verify_text):
-                log.append(f"Domain {domain} rejected at final foreign-check (page shows foreign location, no Canadian evidence)")
+                log.append(f"Domain {domain} rejected at final foreign-check")
                 domain = None
         except Exception:
             pass
@@ -1420,7 +1517,6 @@ async def _osint_impl(body: OsintIn):
         if harvester_emails:
             emails += harvester_emails
             log.append(f"theHarvester: Found {len(harvester_emails)} passive email targets")
-            # Log harvest source
             add_raw_source(
                 f"crt.sh domain search: {domain}",
                 str(harvester_emails[:500]),
@@ -1432,8 +1528,8 @@ async def _osint_impl(body: OsintIn):
     # 3. Crawl Target Site Sub-Pages (Render & Clean Markdown)
     if domain:
         base = f"https://{domain}"
+        print(f"   🕸️ [CRAWL] Crawling https://{domain} and leadership sub-pages...", flush=True)
 
-        # Priority keyword hints for leadership, executive, governance, medical, contact & team pages
         PRIORITY_PATH_HINTS = (
             "contact", "joindre", "coordonnees", "coordonnées", "a-propos", "apropos", "propos",
             "about", "equipe", "équipe", "team", "direction", "notre-entreprise", "staff",
@@ -1446,7 +1542,6 @@ async def _osint_impl(body: OsintIn):
         def is_priority_link(text_and_url: str) -> bool:
             return any(k in text_and_url.lower() for k in PRIORITY_PATH_HINTS)
 
-        # 1. Fetch & analyze the homepage first
         home = await osint_fetch(base)
         home_html = unmask_cloudflare_emails(home.get("html", ""))
         add_raw_source(
@@ -1455,7 +1550,6 @@ async def _osint_impl(body: OsintIn):
             "site discovery"
         )
 
-        # Extract all internal links from the homepage navigation, header, menus, and footer
         soup_home = BeautifulSoup(home_html, "html.parser")
         tier1_pages: List[str] = []
         tier2_pages: List[str] = []
@@ -1502,7 +1596,6 @@ async def _osint_impl(body: OsintIn):
                 continue
             seen.add(p)
 
-            # Homepage was already fetched above
             if p == base and home_html:
                 page_html = home_html
             else:
@@ -1512,10 +1605,8 @@ async def _osint_impl(body: OsintIn):
             if not page_html:
                 continue
 
-            # Clean page into structured Markdown
             markdown_content = clean_html_to_markdown(page_html)
 
-            # Log raw extraction source with HTML preview
             extraction_summary = []
             emails_found = clean_emails(EMAIL_RE.findall(page_html))
             if emails_found:
@@ -1524,7 +1615,6 @@ async def _osint_impl(body: OsintIn):
             if phones_found:
                 extraction_summary.append("phone_regex")
 
-            # Extract structured person cards directly from DOM
             dom_people = extract_people_from_dom(page_html)
             if dom_people:
                 extraction_summary.append("dom_people_cards")
@@ -1537,7 +1627,6 @@ async def _osint_impl(body: OsintIn):
                     if dp.get("phone"):
                         phones.append(dp["phone"])
 
-            # Extract named executives with French & English leadership patterns
             extracted_people = extract_people_from_markdown(markdown_content)
             if extracted_people:
                 extraction_summary.append("exec_people_pattern")
@@ -1549,7 +1638,6 @@ async def _osint_impl(body: OsintIn):
             emails += emails_found
             phones += phones_found
 
-            # Extract Social Handles
             page_soup = BeautifulSoup(page_html, "html.parser")
             for a in page_soup.select("a[href]"):
                 h = a.get("href", "")
@@ -1565,7 +1653,7 @@ async def _osint_impl(body: OsintIn):
                 if m:
                     address = m.group(0)
 
-            # Recursive link discovery: If this crawled page contains new priority links (e.g. /staff/dr-...), queue them
+            # Recursive priority link discovery
             for a in page_soup.select("a[href]"):
                 sub_href = a.get("href", "").strip()
                 if not sub_href or sub_href.startswith(("#", "javascript:", "mailto:", "tel:")):
@@ -1576,10 +1664,8 @@ async def _osint_impl(body: OsintIn):
                     if sub_full not in seen and sub_full not in crawl_queue:
                         combo = (a.get_text() or "").lower() + " " + sub_href.lower()
                         if is_priority_link(combo):
-                            # Insert newly discovered priority sub-links at the front of the queue
                             crawl_queue.insert(0, sub_full)
 
-            # Log the raw HTML/JS source
             add_raw_source(
                 p, page_html,
                 extraction_summary if extraction_summary else ["general_html_parse"],
@@ -1588,21 +1674,18 @@ async def _osint_impl(body: OsintIn):
             log.append(f"Crawled {p} (Found {len(people)} people, {len(emails)} emails so far)")
 
     # 4. Executive Pattern Candidate Permutations
-    # Generate unique pattern-based emails for executives who don't have personal emails
     if domain and people:
-        seen_emails_for_pattern = set(emails)  # Track emails already found
-        for p_entry in people[:6]:  # Limit to top 6 executives
+        seen_emails_for_pattern = set(emails)
+        for p_entry in people[:6]:
             candidates = generate_candidate_permutations(p_entry["name"], domain)
-            # Filter to unused patterns
             unused_patterns = [c for c in candidates if c not in seen_emails_for_pattern]
             if unused_patterns:
                 emails.append(unused_patterns[0])
                 seen_emails_for_pattern.add(unused_patterns[0])
                 p_entry["email"] = unused_patterns[0]
-                if candidates:
-                    log.append(f"Permutator: Generated unique email for {p_entry['name']}")
+                log.append(f"Permutator: Generated unique email for {p_entry['name']}")
 
-    # 5. Social Media & Public Profile Deep Mining (Facebook, Instagram, LinkedIn)
+    # 5. Social Media & Public Profile Deep Mining
     social_targets = [
         ("facebook.com", "facebook.com", f'site:facebook.com "{search_name}" {city_str}'),
         ("instagram.com", "instagram.com", f'site:instagram.com "{search_name}" {city_str}'),
@@ -1613,7 +1696,7 @@ async def _osint_impl(body: OsintIn):
         if social_key in socials and social_key != "linkedin.com/in":
             continue
         try:
-            found = await search(f"https://duckduckgo.com/html/?q={quote_plus(sq.strip())}")
+            found = await search(sq.strip())
             for candidate_url in found[:3]:
                 host = urlparse(candidate_url).netloc.lower().replace("www.", "")
                 if platform_key.split("/")[0] not in host:
@@ -1623,7 +1706,6 @@ async def _osint_impl(body: OsintIn):
                 candidate_html = unmask_cloudflare_emails(candidate.get("html", ""))
                 candidate_text = clean_html_to_markdown(candidate_html)
 
-                # Log social profile extraction source
                 add_raw_source(
                     candidate_url, candidate_html,
                     ["meta_description", "profile_summary", "href_links", "contact_info"],
@@ -1635,19 +1717,16 @@ async def _osint_impl(body: OsintIn):
                         socials[social_key] = candidate_url
                         log.append(f"Validated Canadian {social_key}: {candidate_url}")
 
-                    # Mine social profile for direct emails
                     social_emails = clean_emails(EMAIL_RE.findall(candidate_html))
                     if social_emails:
                         emails += social_emails
                         log.append(f"Social {social_key}: Extracted {len(social_emails)} email(s)")
 
-                    # Mine social profile for direct phone numbers
                     social_phones = [norm_phone(m) for m in PHONE_RE.finditer(candidate_text)]
                     if social_phones:
                         phones += social_phones
                         log.append(f"Social {social_key}: Extracted {len(social_phones)} phone(s)")
 
-                    # If official domain not yet discovered, check outbound links on social page
                     if not domain:
                         outbound_social = extract_outbound_company_links(candidate_html, company_name, input_trade_names)
                         for ob_url in outbound_social:
@@ -1657,7 +1736,6 @@ async def _osint_impl(body: OsintIn):
                                 log.append(f"Domain extracted from social outbound profile: {domain}")
                                 break
 
-                    # If LinkedIn personal profile, extract named executive and title
                     if "linkedin.com/in" in candidate_url:
                         lp_people = extract_people_from_markdown(candidate_text)
                         for lp in lp_people:
@@ -1671,11 +1749,11 @@ async def _osint_impl(body: OsintIn):
         except Exception as e:
             log.append(f"{social_key} search failed: {e}")
 
-    # 5b. Targeted Executive Reconnaissance Search (if no executive identified yet)
+    # 5b. Targeted Executive Reconnaissance Search
     if not people:
         try:
             exec_query = f'"{clean_name}" (président OR propriétaire OR directeur OR dentiste OR dirigeant OR fondateur)'
-            exec_hits = await search(f"https://duckduckgo.com/html/?q={quote_plus(exec_query)}")
+            exec_hits = await search(exec_query)
             for candidate_url in exec_hits[:3]:
                 candidate = await osint_fetch(candidate_url, wait_ms=600)
                 candidate_html = unmask_cloudflare_emails(candidate.get("html", ""))
@@ -1694,13 +1772,12 @@ async def _osint_impl(body: OsintIn):
     # 6. User Custom Target Sites
     for extra in targets:
         try:
-            hits = await search(f"https://duckduckgo.com/html/?q={quote_plus(f'site:{extra} {clean_name}')}")
+            hits = await search(f"site:{extra} {clean_name}")
             for u in hits[:2]:
                 r = await osint_fetch(u, wait_ms=1000)
                 html_content = r["html"]
                 txt = clean_html_to_markdown(html_content)
 
-                # Log custom site extraction
                 emails_in_page = EMAIL_RE.findall(txt)
                 phones_in_page = [norm_phone(m) for m in PHONE_RE.finditer(txt)]
                 add_raw_source(
@@ -1712,15 +1789,14 @@ async def _osint_impl(body: OsintIn):
                 if not trusted_company_page(txt, u, company_name, body.neq, domain):
                     log.append(f"Extra site rejected (company mismatch): {u}")
                     continue
-                emails += EMAIL_RE.findall(txt)
-                phones += [norm_phone(m) for m in PHONE_RE.finditer(txt)]
+                emails += emails_in_page
+                phones += phones_in_page
                 log.append(f"Extra site {extra}: {u}")
         except Exception as e:
             log.append(f"Extra site {extra} failed: {e}")
 
     # 7. Clean, Deduplicate & Prioritize Executive Personal vs. Generic Inboxes
     cleaned_all_emails = clean_emails(emails)
-    
     exec_emails = []
     generic_emails = []
     for em in cleaned_all_emails:
@@ -1772,7 +1848,6 @@ async def _osint_impl(body: OsintIn):
         if cross.get(e, {}).get("matched") or (domain and e.endswith("@" + domain))
     ]
 
-    # Add raw execution sources to log for frontend "pre-record activity"
     if raw_execution_sources:
         for src in raw_execution_sources[:15]:
             url = src.get("url", "")
@@ -1804,7 +1879,7 @@ async def _osint_impl(body: OsintIn):
         "cross_check": cross,
         "trail": log[-30:],
         "log": log,
-        "raw_execution_sources": raw_execution_sources[:20],  # New field for detailed provenance
+        "raw_execution_sources": raw_execution_sources[:20],
     }
 
 
@@ -1920,8 +1995,11 @@ def _do_smtp_send(cfg: SmtpSendIn) -> Dict[str, Any]:
 @app.post("/smtp/test")
 async def smtp_test(body: SmtpBase, x_worker_secret: Optional[str] = Header(None)):
     verify_auth(x_worker_secret)
+    print(f"📧 [SMTP] Testing connection to {body.host}:{body.port} ({body.security})...", flush=True)
     try:
-        return await asyncio.wait_for(asyncio.to_thread(_do_smtp_test, body), timeout=SMTP_TIMEOUT + 10)
+        res = await asyncio.wait_for(asyncio.to_thread(_do_smtp_test, body), timeout=SMTP_TIMEOUT + 10)
+        print(f"   [SMTP] Test result: {res.get('message')}", flush=True)
+        return res
     except asyncio.TimeoutError:
         return {"ok": False, "message": f"SMTP test timed out after {SMTP_TIMEOUT + 10}s."}
 
@@ -1929,9 +2007,11 @@ async def smtp_test(body: SmtpBase, x_worker_secret: Optional[str] = Header(None
 @app.post("/smtp/send")
 async def smtp_send(body: SmtpSendIn, x_worker_secret: Optional[str] = Header(None)):
     verify_auth(x_worker_secret)
+    print(f"📧 [SMTP] Sending email to {body.to} via {body.host}...", flush=True)
     try:
         result = await asyncio.wait_for(asyncio.to_thread(_do_smtp_send, body), timeout=SMTP_TIMEOUT + 20)
     except asyncio.TimeoutError:
         result = {"ok": False, "message": f"Sending timed out after {SMTP_TIMEOUT + 20}s."}
     app.state.stats["emails_sent" if result.get("ok") else "emails_failed"] += 1
+    print(f"   [SMTP] Send result: {result.get('message')}", flush=True)
     return result
