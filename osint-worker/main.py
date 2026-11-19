@@ -62,6 +62,11 @@ OSINT_TIMEOUT = max(30, min(300, int(os.environ.get("OSINT_TIMEOUT_SECONDS", "15
 SMTP_TIMEOUT = max(10, min(120, int(os.environ.get("SMTP_TIMEOUT_SECONDS", "30"))))
 MAX_OSINT_BROWSER_FALLBACKS = max(0, min(6, int(os.environ.get("MAX_OSINT_BROWSER_FALLBACKS", "2"))))
 
+# Free Search API Keys (Zero Cost, No Scraping/Captchas)
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "").strip()
+GOOGLE_CSE_KEY = os.environ.get("GOOGLE_CSE_KEY", "").strip()
+GOOGLE_CSE_CX = os.environ.get("GOOGLE_CSE_CX", "").strip()
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -163,6 +168,54 @@ def name_matches_host(company_name: str, trade_names: List[str], host: str) -> b
                 if len(acr) >= 3 and acr in base:
                     return True
     return False
+
+
+def dns_resolves(host: str) -> bool:
+    """Instant local/DNS address lookup in 5ms without scraping."""
+    if not host or "." not in host:
+        return False
+    try:
+        socket.gethostbyname(host)
+        return True
+    except Exception:
+        return False
+
+
+GENERIC_BUSINESS_WORDS = {
+    "centre", "clinique", "sante", "groupe", "compagnie", "cie", "corporation", "corp",
+    "societe", "services", "service", "association", "fondation", "institut", "bureau",
+    "atelier", "quebec", "canada", "radio", "media", "medias", "presse", "journal",
+    "consultants", "consultant", "consulting", "construction", "transport", "transports",
+    "plomberie", "electricite", "auto", "garage", "restaurant", "bar", "cafe", "hotel",
+    "dentaire", "dentistes", "medical", "expert", "experts", "solution", "solutions",
+    "gestion", "holding", "enterprises", "entreprises", "entreprise", "industries", "inc",
+    "ltee", "ltd", "corp", "coop"
+}
+
+
+def guess_domains(name: str) -> List[str]:
+    """Generates candidate domains from company name for direct DNS probing."""
+    clean = deaccent(LEGAL_SUFFIX_RE.sub(" ", name).strip().lower())
+    toks = [t for t in re.split(r"[^a-z0-9]+", clean) if len(t) >= 3 and t not in ("des", "les", "aux", "pour", "the", "and", "par", "inc", "ltee")]
+    if not toks:
+        return []
+    bases = ["".join(toks), "-".join(toks)]
+    distinctive_toks = [t for t in toks if t not in GENERIC_BUSINESS_WORDS]
+    if distinctive_toks:
+        bases.append("".join(distinctive_toks))
+        bases.append("-".join(distinctive_toks))
+        if len(distinctive_toks) == 1 and len(distinctive_toks[0]) >= 4:
+            bases.append(distinctive_toks[0])
+    if len(toks) >= 2:
+        bases.append("".join(toks[:2]))
+    if len(toks) >= 3:
+        bases.append("".join(w[0] for w in toks))
+    bases = [b for b in dict.fromkeys(bases) if 3 <= len(b) <= 30 and b not in GENERIC_BUSINESS_WORDS]
+    out = []
+    for b in bases:
+        for tld in (".ca", ".com", ".qc.ca"):
+            out.append(b + tld)
+    return list(dict.fromkeys(out))[:10]
 
 
 def extract_outbound_company_links(html: str, company_name: str, trade_names: List[str]) -> List[str]:
@@ -277,6 +330,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RECYC-Contact-OSINT Worker", lifespan=lifespan)
+app.state.pw = None
+app.state.browser = None
+app.state.browser_lock = asyncio.Lock()
+app.state.lock = asyncio.Semaphore(MAX_BROWSER_PAGES)
+app.state.stats = {
+    "active": 0, "queued": 0, "completed": 0, "failed": 0, "restarts": 0,
+    "emails_sent": 0, "emails_failed": 0, "started_at": time.time(),
+}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -595,11 +656,11 @@ def clean_html_to_markdown(raw_html: str) -> str:
 async def fetch_text(url: str, wait_ms: int = 900, allow_browser: bool = True) -> Dict[str, str]:
     try:
         async with httpx.AsyncClient(
-            timeout=15, follow_redirects=True,
+            timeout=8, follow_redirects=True,
             headers={"User-Agent": UA, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"},
         ) as client:
             r = await client.get(url)
-            if r.status_code < 400 and len(r.text) > 800 and "Just a moment" not in r.text:
+            if r.status_code < 400 and len(r.text) > 200 and "Just a moment" not in r.text:
                 return {"html": unmask_cloudflare_emails(r.text), "url": str(r.url)}
     except Exception:
         pass
@@ -1060,7 +1121,7 @@ def _extract_search_links(html: str, link_filter=None) -> List[str]:
 
 
 async def search(query_or_url: str, link_filter=None, allow_browser: bool = True) -> List[str]:
-    """Multi-engine search querying DuckDuckGo, Bing, and Yahoo with automatic failover."""
+    """Multi-engine search querying Brave API, Google CSE, DuckDuckGo, Bing, and Yahoo with automatic failover."""
     parsed = urlparse(query_or_url)
     qs = parse_qs(parsed.query)
     q = qs.get("q", [""])[0] or qs.get("p", [""])[0]
@@ -1070,20 +1131,59 @@ async def search(query_or_url: str, link_filter=None, allow_browser: bool = True
     clean_q = q or query_or_url
     results: List[str] = []
 
+    # 0. Brave Search API (2,000 free queries/month, clean JSON, zero CAPTCHA on Colab)
+    if BRAVE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                br = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params={"q": clean_q, "count": 10, "country": "ca", "search_lang": "fr"},
+                    headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
+                )
+                if br.status_code == 200:
+                    items = (br.json().get("web") or {}).get("results") or []
+                    for it in items:
+                        u = it.get("url")
+                        if u and u.startswith("http"):
+                            host = urlparse(u).netloc.lower().replace("www.", "")
+                            if not any(b in host for b in BAD_HOSTS) and (not link_filter or link_filter(u)) and u not in results:
+                                results.append(u)
+        except Exception:
+            pass
+
+    # 0b. Google Custom Search JSON API (100 free queries/day)
+    if GOOGLE_CSE_KEY and GOOGLE_CSE_CX and len(results) < 5:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                gr = await client.get(
+                    "https://www.googleapis.com/customsearch/v1",
+                    params={"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": clean_q, "num": 10},
+                )
+                if gr.status_code == 200:
+                    for it in gr.json().get("items", []):
+                        u = it.get("link")
+                        if u and u.startswith("http"):
+                            host = urlparse(u).netloc.lower().replace("www.", "")
+                            if not any(b in host for b in BAD_HOSTS) and (not link_filter or link_filter(u)) and u not in results:
+                                results.append(u)
+        except Exception:
+            pass
+
     # 1. DuckDuckGo HTML endpoint with clean Firefox User-Agent (avoids 202 challenge)
-    ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(clean_q)}"
-    try:
-        async with httpx.AsyncClient(
-            timeout=8, follow_redirects=True,
-            headers={"User-Agent": UA_SEARCH, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
-        ) as client:
-            r = await client.get(ddg_url)
-            if r.status_code == 200:
-                for l in _extract_search_links(r.text, link_filter):
-                    if l not in results:
-                        results.append(l)
-    except Exception:
-        pass
+    if len(results) < 5:
+        ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(clean_q)}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=8, follow_redirects=True,
+                headers={"User-Agent": UA_SEARCH, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"}
+            ) as client:
+                r = await client.get(ddg_url)
+                if r.status_code == 200:
+                    for l in _extract_search_links(r.text, link_filter):
+                        if l not in results:
+                            results.append(l)
+        except Exception:
+            pass
 
     # 2. Bing endpoint (essential fallback for Canadian index coverage)
     if len(results) < 5:
@@ -1264,7 +1364,7 @@ class OsintIn(BaseModel):
     postal_code: Optional[str] = None
     extra_sites: List[str] = []
     sites: List[str] = []
-    max_pages: int = 35
+    max_pages: int = 15
     activity: Optional[str] = None
     trade_names: List[str] = []
 
@@ -1278,8 +1378,21 @@ async def osint(body: OsintIn, x_worker_secret: Optional[str] = Header(None)):
     if body.neq:
         print(f"   📋 NEQ: {body.neq} | City: {body.city or 'N/A'} | Province: {body.province or 'Quebec'}", flush=True)
     t0 = time.time()
+    state_box: Dict[str, Any] = {
+        "ok": False,
+        "domain": body.domain,
+        "address": body.address,
+        "emails": [],
+        "phones": [],
+        "people": [],
+        "socials": {},
+        "log": [],
+        "trail": [],
+        "raw_execution_sources": [],
+        "cross_check": {},
+    }
     try:
-        res = await asyncio.wait_for(_osint_impl(body), timeout=OSINT_TIMEOUT)
+        res = await asyncio.wait_for(_osint_impl(body, state_box), timeout=OSINT_TIMEOUT)
         dur = round(time.time() - t0, 1)
         dom = res.get("domain") or "None"
         num_emails = len(res.get("emails", []))
@@ -1296,25 +1409,26 @@ async def osint(body: OsintIn, x_worker_secret: Optional[str] = Header(None)):
         return res
     except asyncio.TimeoutError:
         app.state.stats["failed"] += 1
-        print(f"⏱️ [OSINT] Timeout after {OSINT_TIMEOUT}s for: '{cname}'\n{'='*70}\n", flush=True)
-        return {
-            "ok": False,
-            "error": f"company deadline exceeded ({OSINT_TIMEOUT}s)",
-            "emails": [], "phones": [], "people": [], "socials": {},
-            "log": ["worker deadline reached; app will retry this company"],
-        }
+        found = bool(state_box["emails"] or state_box["phones"] or state_box["people"] or state_box["domain"])
+        print(f"⏱️ [OSINT] Timeout after {OSINT_TIMEOUT}s for: '{cname}' -> returning partial discoveries (found={found})\n{'='*70}\n", flush=True)
+        state_box["ok"] = found
+        state_box["partial"] = True
+        state_box["error"] = f"company deadline exceeded ({OSINT_TIMEOUT}s)"
+        state_box["log"].append("company deadline reached; partial results preserved")
+        state_box["trail"] = state_box["log"][-30:]
+        return state_box
     except Exception as e:
         app.state.stats["failed"] += 1
         print(f"❌ [OSINT] Internal error for '{cname}': {e}\n{'='*70}\n", flush=True)
-        return {
-            "ok": False,
-            "error": str(e),
-            "emails": [], "phones": [], "people": [], "socials": {},
-            "log": [f"worker internal error: {e}"],
-        }
+        found = bool(state_box["emails"] or state_box["phones"] or state_box["people"] or state_box["domain"])
+        state_box["ok"] = found
+        state_box["error"] = str(e)
+        state_box["log"].append(f"worker internal error: {e}")
+        state_box["trail"] = state_box["log"][-30:]
+        return state_box
 
 
-async def _osint_impl(body: OsintIn):
+async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None):
     company_name = (body.company or body.company_name or "").strip()
     if not company_name:
         return {"ok": False, "error": "company name missing", "emails": [], "phones": [],
@@ -1332,6 +1446,18 @@ async def _osint_impl(body: OsintIn):
     input_trade_names = [t.strip() for t in (body.trade_names or []) if t.strip()]
     browser_budget = MAX_OSINT_BROWSER_FALLBACKS
     raw_execution_sources: List[Dict[str, Any]] = []
+
+    def sync_state():
+        if state_box is not None:
+            state_box["domain"] = domain
+            state_box["address"] = address
+            state_box["emails"] = clean_emails(emails)
+            state_box["phones"] = list(dict.fromkeys(phones))
+            state_box["people"] = people
+            state_box["socials"] = socials
+            state_box["log"] = log
+            state_box["trail"] = log[-30:]
+            state_box["raw_execution_sources"] = raw_execution_sources[:20]
 
     async def osint_fetch(url: str, wait_ms: int = 900) -> Dict[str, str]:
         nonlocal browser_budget
@@ -1393,8 +1519,27 @@ async def _osint_impl(body: OsintIn):
                     "google_maps"
                 )
                 socials["maps.google.com"] = f"https://www.google.com/maps/search/{quote_plus(maps_query)}/"
+            sync_state()
     except Exception as e:
         log.append(f"Google Maps recon pass: {e}")
+        sync_state()
+
+    # 1b. Fast DNS Domain Guessing (Resolves in 5ms, zero search engines)
+    if not domain and clean_name:
+        guessed = guess_domains(clean_name)
+        for g_dom in guessed:
+            if dns_resolves(g_dom) and not is_directory_host(g_dom) and name_matches_host(company_name, input_trade_names, g_dom):
+                cand = await osint_fetch(f"https://{g_dom}", wait_ms=400)
+                if cand.get("html"):
+                    c_txt = clean_html_to_markdown(cand["html"])
+                    distinctive_words = [w for w in clean_name.lower().split() if len(w) >= 4 and w not in GENERIC_BUSINESS_WORDS]
+                    matches = any(w in c_txt.lower() for w in distinctive_words) if distinctive_words else (clean_name.lower() in c_txt.lower())
+                    if matches:
+                        domain = g_dom
+                        log.append(f"DNS Domain Guessing: Discovered verified domain -> {domain}")
+                        print(f"      🌐 Discovered domain via DNS: {domain}", flush=True)
+                        sync_state()
+                        break
 
     # 1. Official Domain Discovery (with directory-trap protection)
     if not domain:
@@ -1454,6 +1599,7 @@ async def _osint_impl(body: OsintIn):
                     add_raw_source(ob_url, ob_page["html"],
                         ["domain_verification", "directory_outbound"],
                         "directory extracted domain")
+                    sync_state()
                     break
                 continue
 
@@ -1473,6 +1619,7 @@ async def _osint_impl(body: OsintIn):
                     ["domain_verification", "company_mention"],
                     "domain discovery page"
                 )
+                sync_state()
                 break
 
     # 1b. Canadian Business Registry Lookup (Numbered entities & SMBs)
@@ -1606,17 +1753,16 @@ async def _osint_impl(body: OsintIn):
 
         # Seed standard speculative paths for leadership, board, governance, medical, executive & contact pages
         SPECULATIVE_SUBPATHS = [
-            "/conseil-dadministration", "/conseil-d-administration", "/conseil-administration", "/conseil",
-            "/equipe", "/notre-equipe", "/direction", "/people", "/team", "/our-team", "/our-people",
-            "/leadership", "/board", "/directors", "/executives", "/staff", "/administrateurs",
-            "/gouvernance", "/gestion", "/membres", "/dentistes", "/dentiste", "/notre-equipe-dentaire",
-            "/docteurs", "/docteur", "/practitioners", "/a-propos", "/contact", "/contactez-nous", "/nous-joindre"
+            "/a-propos", "/apropos", "/about",
+            "/equipe", "/notre-equipe", "/direction", "/team",
+            "/conseil-d-administration", "/conseil-administration",
+            "/contact", "/contactez-nous", "/nous-joindre"
         ]
         has_leadership_page = any(
-            any(k in p.lower() for k in ("equipe", "direction", "conseil", "people", "team", "leadership", "board", "executives", "staff", "dentiste", "docteur", "admin"))
+            any(k in p.lower() for k in ("equipe", "direction", "conseil", "people", "team", "leadership", "board", "executives", "staff", "dentiste", "docteur", "admin", "propos", "about"))
             for p in tier1_pages
         )
-        if len(tier1_pages) < 4 or not has_leadership_page:
+        if len(tier1_pages) < 3 or not has_leadership_page:
             for sub in SPECULATIVE_SUBPATHS:
                 spec_url = urljoin(base, sub)
                 if spec_url not in tier1_pages:
