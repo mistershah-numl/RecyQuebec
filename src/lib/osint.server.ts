@@ -75,7 +75,7 @@ const BAD_DOMAINS = [
   "zone-renovation.com",
   "construction.qc.ca",
   "entrepri-renov.qc.ca",
-  // Restaurant / food delivery portals
+  // Restaurant / food delivery portals & third-party ordering systems
   "restaurantguru.com",
   "restomontreal.ca",
   "restoenligne.ca",
@@ -84,6 +84,21 @@ const BAD_DOMAINS = [
   "doordash.com",
   "skipthedishes.com",
   "grubhub.com",
+  "mealkeyway.com",
+  "toasttab.com",
+  "chownow.com",
+  "clover.com",
+  "touchbistro.com",
+  "menufy.com",
+  "order.online",
+  "getbento.com",
+  "popmenu.com",
+  "allmenus.com",
+  "sirved.com",
+  "menuism.com",
+  "opentable.com",
+  "opentable.ca",
+  "resy.com",
   // Travel / review portals
   "tripadvisor.com",
   "tripadvisor.ca",
@@ -413,7 +428,8 @@ async function workerFetch(url: string, timeoutMs: number, parentSignal?: AbortS
     clearTimeout(timer);
     parentSignal?.removeEventListener("abort", abort);
     if (!res.ok) return null;
-    const data = (await res.json()) as { html?: string; text?: string };
+    const data = (await res.json()) as { ok?: boolean; status?: number; html?: string; text?: string };
+    if (data.ok === false || (data.status && data.status >= 400)) return null;
     const body = data.html ?? data.text ?? null;
     return body ? unmaskCloudflareEmails(body.slice(0, 400_000)) : null;
   } catch {
@@ -577,7 +593,7 @@ async function safeFetch(url: string, timeoutMs = 8000, parentSignal?: AbortSign
     clearTimeout(timer);
     parentSignal?.removeEventListener("abort", abort);
     if (!res.ok) {
-      if (isSearch) return null;
+      if (res.status === 404 || isSearch) return null;
       return await workerFetch(url, timeoutMs, parentSignal);
     }
     const type = res.headers.get("content-type") ?? "";
@@ -852,14 +868,33 @@ const NON_NAME_WORDS = new Set([
   "notre", "votre", "equipe", "équipe", "clinique", "dentaire", "centre", "cabinet", "bureau",
   "conseil", "administration", "gouvernance", "direction", "membres", "personnel", "staff",
   "denturologiste", "hygiéniste", "hygieniste", "assistante", "assistant", "réceptionniste", "receptionniste",
-  "infirmier", "infirmière", "technicien", "technicienne"
+  "infirmier", "infirmière", "technicien", "technicienne",
+  // Mechanical, business, medical and trade keywords
+  "rotating", "equipment", "specialist", "specialists", "millwright", "machinist", "machinists",
+  "mechanic", "mechanics", "engineering", "engineer", "engineers", "industrial", "precision",
+  "maintenance", "technologies", "technology", "solutions", "service", "products", "product",
+  "systems", "system", "dentisterie", "dentaires", "général", "générale", "general", "generale",
+  "implantologie", "orthodontie", "endodontie", "parodontie", "esthétique", "esthetique",
+  "soins", "santé", "sante", "médical", "medical", "médicale", "medicale",
+  "commercial", "commerciale", "residentiel", "résidentiel", "residentielle", "résidentielle",
+  "industriel", "industrielle", "cuisine", "restaurant", "menu", "bar", "cafe", "café", "bistro",
+  "bistrot", "pizzéria", "pizzeria", "traiteur", "catering", "garderie", "educative", "éducative",
+  "garderies", "pouponnière", "pouponniere", "gardienne", "transport", "logistique", "livraison",
+  "shipping", "freight", "trucking", "construction", "renovation", "rénovation", "toiture",
+  "maçonnerie", "maconnerie", "peinture", "gestion", "consulting", "consultation", "comptabilité",
+  "comptabilite", "finance", "finances", "radio", "diffusion", "station", "communautaire",
+  "musique", "spectacle", "accueil", "home", "welcome", "index", "portal", "page", "site",
+  "website", "mission", "vision", "valeurs", "values", "history", "histoire", "temoignages",
+  "témoignages", "reviews", "avis", "faq", "heures", "hours", "horaire", "schedule", "location",
+  "emplacement", "adresse", "address", "telephone", "téléphone", "courriel", "email", "contactez",
+  "suivez", "follow", "social"
 ]);
 
 export function cleanPersonName(raw: string): string {
   return raw
     .replace(/^#+\s*/, "")
     .replace(/^\[([^\]]+)\].*$/, "$1")
-    .replace(/^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*/i, "")
+    .replace(/^(?:Dr\.?|Dre\.?|Me\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*/i, "")
     .replace(
       /\s*(?:vice|pr[ée]sident(?:e)?|direct(?:eur|rice)|president|ceo|owner|fondat(?:eur|rice)|associ[ée](?:e)?|g[ée]rant(?:e)?|chief|partner|director|dentiste|chirurgien(?:ne)?|docteur(?:e)?|dr|m[ée]decin|avocat(?:e)?|notaire|comptable|gestionnaire|administrat(?:eur|rice)|denturologiste|hygi[ée]niste|assistante?|r[ée]ceptionniste)$/i,
       "",
@@ -909,6 +944,51 @@ function collectPeople(text: string): { name: string; title: string; email?: str
     }
   }
 
+  // Narrative sentence extraction (e.g. "Founded by President and Owner Kevin Lachance", "Fondé par Christian Rock")
+  const TITLE_SINGLE =
+    "(?:Président(?:e)?|Vice[- ]Président(?:e)?|Direct(?:eur|rice)|Propriétaire|Fondat(?:eur|rice)|" +
+    "Associé(?:e)?|Gérant(?:e)?|Administrat(?:eur|rice)|DG|PDG|Chief Executive Officer|CEO|CFO|COO|" +
+    "CTO|CMO|CRO|President|Owner|Founder|General Manager|Managing Director|Partner|Executive Director|" +
+    "Director|VP|Vice[- ]President|Dentiste|Chirurgien(?:ne)?|Docteur(?:e)?|Dre?|Médecin|Avocat(?:e)?|Notaire)";
+
+  const patNarrativeEn = new RegExp(
+    `\\b(${TITLE_SINGLE}(?:\\s*(?:and|&|et)\\s*${TITLE_SINGLE})?)\\s+([A-ZÀ-Ý][a-zà-ÿ'’-]+(?:\\s+[A-ZÀ-Ý][a-zà-ÿ'’-]+){1,2})\\b`,
+    "gui"
+  );
+  let mEn: RegExpExecArray | null;
+  while ((mEn = patNarrativeEn.exec(text)) && out.length < 30) {
+    const rawTitle = mEn[1]?.trim() || "Executive";
+    const rawName = mEn[2]?.trim();
+    if (!rawName) continue;
+    const cleanName = cleanPersonName(rawName);
+    if (isValidPersonName(cleanName)) {
+      const norm = cleanName.toLowerCase();
+      if (!seen.has(norm)) {
+        seen.add(norm);
+        out.push({ name: cleanName, title: rawTitle });
+      }
+    }
+  }
+
+  const patNarrativeFr = new RegExp(
+    `\\b(?:fondé|fondée|créé|créée|dirigé|dirigée)\\s+par\\s+(?:(?:l[ea]|notre)\\s+)?(${TITLE_SINGLE}\\s+)?([A-ZÀ-Ý][a-zà-ÿ'’-]+(?:\\s+[A-ZÀ-Ý][a-zà-ÿ'’-]+){1,2})\\b`,
+    "gui"
+  );
+  let mFr: RegExpExecArray | null;
+  while ((mFr = patNarrativeFr.exec(text)) && out.length < 30) {
+    const rawTitle = mFr[1]?.trim() || "Fondateur / Dirigeant";
+    const rawName = mFr[2]?.trim();
+    if (!rawName) continue;
+    const cleanName = cleanPersonName(rawName);
+    if (isValidPersonName(cleanName)) {
+      const norm = cleanName.toLowerCase();
+      if (!seen.has(norm)) {
+        seen.add(norm);
+        out.push({ name: cleanName, title: rawTitle });
+      }
+    }
+  }
+
   // 2. Multi-line card pattern (Name on line N, Title on line N+1..N+5, OR Title on line N, Name on line N+1..N+4)
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
   const titleSubRe = new RegExp(`\\b(${TITLE_WORDS})\\b`, "i");
@@ -926,15 +1006,17 @@ function collectPeople(text: string): { name: string; title: string; email?: str
         let matchedEmail: string | null = null;
         for (let offset = 1; offset <= 5 && i + offset < lines.length; offset++) {
           const candLine = lines[i + offset]!;
-          const mT = candLine.match(titleSubRe);
-          if (mT && !matchedTitle) matchedTitle = mT[0].trim();
+          if (candLine.length <= 80) {
+            const mT = candLine.match(titleSubRe);
+            if (mT && !matchedTitle) matchedTitle = mT[0].trim();
+          }
           const mE = candLine.match(/(?:mailto:)?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/i);
           if (mE && !matchedEmail) matchedEmail = mE[1]!.toLowerCase();
           const candClean = cleanPersonName(candLine.replace(/^#+\s*/, "").trim());
           if (isValidPersonName(candClean) && candClean.toLowerCase() !== norm) break;
         }
 
-        if (!matchedTitle) {
+        if (!matchedTitle && line.length <= 80) {
           const mSame = line.match(titleSubRe);
           if (mSame) matchedTitle = mSame[0].trim();
         }
@@ -981,49 +1063,7 @@ function collectPeople(text: string): { name: string; title: string; email?: str
 }
 
 const CONTACT_HINT =
-  /(contact|nous-joindre|nous_joindre|joindre|coordonnees|coordonn[ée]es|a-propos|apropos|about|equipe|[ée]quipe|team|direction|notre-entreprise|staff|leadership|management|people|ppl|nos-gens|gens|board|administrateurs|directors|executives|partners|associates|conseil|administration|gouvernance|dentiste|docteur|chirurgien|avocat|notaire|medecin|m[ée]decin|gestion|membres)/i;
-
-const COMMON_PATHS = [
-  "/people",
-  "/people/",
-  "/our-people",
-  "/ppl",
-  "/team",
-  "/our-team",
-  "/leadership",
-  "/board",
-  "/directors",
-  "/executives",
-  "/equipe",
-  "/notre-equipe",
-  "/direction",
-  "/conseil-dadministration",
-  "/conseil-d-administration",
-  "/conseil-administration",
-  "/conseil",
-  "/administration",
-  "/administrateurs",
-  "/gouvernance",
-  "/gestion",
-  "/membres",
-  "/staff",
-  "/dentistes",
-  "/dentiste",
-  "/docteurs",
-  "/docteur",
-  "/professionnels",
-  "/about/people",
-  "/about/team",
-  "/about/leadership",
-  "/about-us/people",
-  "/contact",
-  "/contact.html",
-  "/contactez-nous",
-  "/nous-joindre",
-  "/a-propos",
-  "/about",
-  "/coordonnees",
-];
+  /(contact|nous-joindre|nous_joindre|joindre|coordonnees|coordonn[ée]es|a-propos|apropos|about|equipe|[ée]quipe|team|direction|notre-entreprise|staff|leadership|management|people|ppl|nos-gens|gens|board|administrateurs|directors|executives|partners|associates|conseil|administration|gouvernance|dentiste|docteur|chirurgien|avocat|notaire|medecin|m[ée]decin|gestion|membres|owner|founder|president|presidence|qui-sommes-nous|quisommesnous|services|practitioner|dr-|doctor|bio|profile)/i;
 
 function slugToken(name: string): string {
   return name
@@ -1586,32 +1626,45 @@ export async function gatherEvidence(
         texts.push(homeText);
         texts.push((home.match(/mailto:[^"'>\s]+/gi) ?? []).join(" "));
 
+        const priorityInternal: string[] = [];
+        const generalInternal: string[] = [];
         for (const m of home.matchAll(/<a\s+[^>]*href=["']([^"'#\s>]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
           const href = m[1]!.replace(/&amp;/g, "&");
           const anchorText = m[2]!.replace(/<[^>]+>/g, " ").trim();
-          if (!CONTACT_HINT.test(href) && !CONTACT_HINT.test(anchorText)) continue;
           try {
             const abs = new URL(href, candidate).toString();
-            if (hostOf(abs) === domain) internal.add(abs);
+            if (hostOf(abs) === domain) {
+              if (CONTACT_HINT.test(href) || CONTACT_HINT.test(anchorText)) {
+                if (!priorityInternal.includes(abs)) priorityInternal.push(abs);
+              } else {
+                if (!generalInternal.includes(abs)) generalInternal.push(abs);
+              }
+            }
           } catch {
             /* ignore */
           }
         }
         for (const m of home.matchAll(/href\s*=\s*["']([^"'#\s>]+)["']/gi)) {
           const href = m[1]!.replace(/&amp;/g, "&");
-          if (!CONTACT_HINT.test(href)) continue;
           try {
             const abs = new URL(href, candidate).toString();
-            if (hostOf(abs) === domain) internal.add(abs);
+            if (hostOf(abs) === domain && !priorityInternal.includes(abs) && !generalInternal.includes(abs)) {
+              if (CONTACT_HINT.test(href)) {
+                priorityInternal.push(abs);
+              } else {
+                generalInternal.push(abs);
+              }
+            }
           } catch {
             /* ignore */
           }
         }
+        for (const u of priorityInternal) internal.add(u);
+        for (const u of generalInternal) internal.add(u);
       }
     }
 
     if (domain && opt.deepCrawl) {
-      for (const p of COMMON_PATHS) internal.add(`${origin}${p}`);
       for (const u of await fetchSitemapPages(origin)) internal.add(u);
     }
 
@@ -1620,8 +1673,8 @@ export async function gatherEvidence(
         .sort((a, b) => {
           const aHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives|conseil|administration|gouvernance|staff|dentiste|docteur|dr-)/i.test(a);
           const bHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives|conseil|administration|gouvernance|staff|dentiste|docteur|dr-)/i.test(b);
-          const aHasContact = /(contact|joindre|coordonnees|a-propos|propos)/i.test(a);
-          const bHasContact = /(contact|joindre|coordonnees|a-propos|propos)/i.test(b);
+          const aHasContact = /(contact|joindre|coordonnees|a-propos|propos|about)/i.test(a);
+          const bHasContact = /(contact|joindre|coordonnees|a-propos|propos|about)/i.test(b);
           if (aHasPeople && !bHasPeople) return -1;
           if (!aHasPeople && bHasPeople) return 1;
           if (aHasContact && !bHasContact) return -1;
@@ -1631,7 +1684,7 @@ export async function gatherEvidence(
         .slice(0, 35);
       const pages = await Promise.all(urls.map((u) => safeFetch(u, 7000)));
       pages.forEach((page, i) => {
-        if (page && urls[i]) sourceUrls.push(urls[i]!);
+        if (page && page.length >= 200 && urls[i]) sourceUrls.push(urls[i]!);
       });
       const secondaryUrls: string[] = [];
       for (const [i, page] of pages.entries()) {

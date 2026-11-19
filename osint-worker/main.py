@@ -98,12 +98,15 @@ BAD_EMAIL_HINTS = (
 )
 BAD_HOSTS = ("duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com")
 
-# Directory / review portals — never accept these as a company's official domain.
+# Directory / review portals & third-party ordering platforms — never accept these as a company's official domain.
 DIRECTORY_DOMAINS = (
     "restaurantguru.com", "yelp.com", "yelp.ca", "tripadvisor.com", "tripadvisor.ca",
     "yellowpages.ca", "pagesjaunes.ca", "canada411.ca", "goldbook.ca", "411.ca",
     "ubereats.com", "doordash.com", "skipthedishes.com", "grubhub.com",
     "restomontreal.ca", "restoenligne.ca", "tastet.ca",
+    "mealkeyway.com", "toasttab.com", "chownow.com", "clover.com", "touchbistro.com",
+    "menufy.com", "order.online", "getbento.com", "popmenu.com", "allmenus.com",
+    "sirved.com", "menuism.com", "opentable.com", "opentable.ca", "resy.com",
     "cylex-canada.ca", "ourbis.ca", "kompass.com", "manta.com",
     "b2bhint.com", "opencorporates.com", "societe.com", "zoominfo.com",
     "crunchbase.com", "glassdoor.com", "indeed.com", "dnb.com",
@@ -410,6 +413,11 @@ def is_search_engine_url(url: str) -> bool:
 
 
 async def _render_impl(body: RenderIn):
+    parsed = urlparse(body.url)
+    host = (parsed.netloc or "").split(":")[0]
+    if host and not is_search_engine_url(body.url) and not dns_resolves(host):
+        return {"ok": False, "status": 0, "url": body.url, "error": "net::ERR_NAME_NOT_RESOLVED", "html": "", "text": ""}
+
     if is_search_engine_url(body.url):
         # Fast path for search engine queries — never launch Chromium for search queries!
         try:
@@ -461,6 +469,9 @@ async def _render_impl(body: RenderIn):
 
             resp = await page.goto(body.url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
             status = resp.status if resp else 0
+            if status == 404:
+                app.state.stats["completed"] += 1
+                return {"ok": False, "status": 404, "url": page.url, "error": "Not Found (404)", "html": "", "text": ""}
 
             # Interstitial check (up to 4 checks = ~3 seconds max)
             for _ in range(4):
@@ -494,7 +505,7 @@ async def _render_impl(body: RenderIn):
             html = unmask_cloudflare_emails(await page.content())
             text = clean_html_to_markdown(html)
             app.state.stats["completed"] += 1
-            return {"ok": True, "status": status, "url": page.url, "html": html, "text": text}
+            return {"ok": (status < 400), "status": status, "url": page.url, "html": html, "text": text}
         except asyncio.CancelledError:
             app.state.stats["failed"] += 1
             raise
@@ -653,21 +664,28 @@ def clean_html_to_markdown(raw_html: str) -> str:
         return BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True)
 
 
-async def fetch_text(url: str, wait_ms: int = 900, allow_browser: bool = True) -> Dict[str, str]:
+async def fetch_text(url: str, wait_ms: int = 900, allow_browser: bool = True) -> Dict[str, Any]:
     try:
         async with httpx.AsyncClient(
-            timeout=8, follow_redirects=True,
+            timeout=8, follow_redirects=True, verify=False,
             headers={"User-Agent": UA, "Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"},
         ) as client:
             r = await client.get(url)
+            if r.status_code == 404:
+                return {"html": "", "url": str(r.url), "ok": False, "status": 404}
             if r.status_code < 400 and len(r.text) > 200 and "Just a moment" not in r.text:
-                return {"html": unmask_cloudflare_emails(r.text), "url": str(r.url)}
+                return {"html": unmask_cloudflare_emails(r.text), "url": str(r.url), "ok": True, "status": r.status_code}
     except Exception:
         pass
     if not allow_browser:
-        return {"html": "", "url": url}
+        return {"html": "", "url": url, "ok": False, "status": 0}
     out = await render(RenderIn(url=url, wait_ms=wait_ms), x_worker_secret=WORKER_SECRET or None)
-    return {"html": unmask_cloudflare_emails(out.get("html", "")), "url": out.get("url", url)}
+    return {
+        "html": unmask_cloudflare_emails(out.get("html", "")),
+        "url": out.get("url", url),
+        "ok": out.get("ok", False),
+        "status": out.get("status", 200 if out.get("ok") else 0),
+    }
 
 
 def deaccent(s: str) -> str:
@@ -706,13 +724,32 @@ NON_NAME_WORDS = {
     "firefox", "browser", "apple", "google", "android", "ios", "adobe", "linux", "ubuntu",
     "login", "signin", "signup", "subscribe", "newsletter", "feedback", "support", "help",
     "careers", "jobs", "press", "media", "news",
+    # Business, technical, and trade domains to prevent non-human false positives
+    "rotating", "equipment", "specialist", "specialists", "millwright", "machinist", "machinists",
+    "mechanic", "mechanics", "engineering", "engineer", "engineers", "industrial", "precision",
+    "maintenance", "technologies", "technology", "solutions", "service", "products", "product",
+    "systems", "system", "dentisterie", "dentaires", "général", "générale", "general", "generale",
+    "implantologie", "orthodontie", "endodontie", "parodontie", "esthétique", "esthetique",
+    "soins", "santé", "sante", "médical", "medical", "médicale", "medicale",
+    "commercial", "commerciale", "residentiel", "résidentiel", "residentielle", "résidentielle",
+    "industriel", "industrielle", "cuisine", "restaurant", "menu", "bar", "cafe", "café", "bistro",
+    "bistrot", "pizzéria", "pizzeria", "traiteur", "catering", "garderie", "educative", "éducative",
+    "garderies", "pouponnière", "pouponniere", "gardienne", "transport", "logistique", "livraison",
+    "shipping", "freight", "trucking", "construction", "renovation", "rénovation", "toiture",
+    "maçonnerie", "maconnerie", "peinture", "gestion", "consulting", "consultation", "comptabilité",
+    "comptabilite", "finance", "finances", "radio", "diffusion", "station", "communautaire",
+    "musique", "spectacle", "accueil", "home", "welcome", "index", "portal", "page", "site",
+    "website", "mission", "vision", "valeurs", "values", "history", "histoire", "temoignages",
+    "témoignages", "reviews", "avis", "faq", "heures", "hours", "horaire", "schedule", "location",
+    "emplacement", "adresse", "address", "telephone", "téléphone", "courriel", "email", "contactez",
+    "suivez", "follow", "social"
 }
 
 
 def clean_person_name(raw: str) -> str:
     name = re.sub(r"^#+\s*", "", raw).strip()
     name = re.sub(r"^\[([^\]]+)\].*$", r"\1", name).strip()
-    name = re.sub(r"^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*", "", name, flags=re.I).strip()
+    name = re.sub(r"^(?:Dr\.?|Dre\.?|Me\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*", "", name, flags=re.I).strip()
     name = re.sub(
         r"\s*(?:vice|président(?:e)?|direct(?:eur|rice)|president|ceo|owner|fondat(?:eur|rice)|associé(?:e)?|gérant(?:e)?|chief|partner|director|dentiste|chirurgien(?:ne)?|docteur(?:e)?|dr|médecin|avocat(?:e)?|notaire|comptable|gestionnaire|administrat(?:eur|rice)|denturologiste|hygi[ée]niste|assistante?|r[ée]ceptionniste)$",
         "",
@@ -886,6 +923,39 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
                 seen.add(clean_norm)
                 results.append({"name": clean_name, "title": raw_title})
 
+    # Narrative sentence extraction (e.g. "Founded by President and Owner Kevin Lachance", "Fondé par Christian Rock")
+    title_single = (
+        r"(?:Président(?:e)?|Vice[- ]Président(?:e)?|Direct(?:eur|rice)|Propriétaire|Fondat(?:eur|rice)|"
+        r"Associé(?:e)?|Gérant(?:e)?|Administrat(?:eur|rice)|DG|PDG|Chief Executive Officer|CEO|CFO|COO|"
+        r"CTO|CMO|CRO|President|Owner|Founder|General Manager|Managing Director|Partner|Executive Director|"
+        r"Director|VP|Vice[- ]President|Dentiste|Chirurgien(?:ne)?|Docteur(?:e)?|Dre?|Médecin|Avocat(?:e)?|Notaire)"
+    )
+    pat_narrative_en = re.compile(
+        rf"\b({title_single}(?:\s*(?i:and|&|et)\s*{title_single})?)\s+([A-ZÀ-Ý][a-zà-ÿ'\-]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ'\-]+){{1,2}})\b"
+    )
+    pat_narrative_fr = re.compile(
+        rf"\b(?i:fondé|fondée|créé|créée|dirigé|dirigée)\s+(?i:par)\s+(?:(?i:l[ea]|notre)\s+)?({title_single}\s+)?([A-ZÀ-Ý][a-zà-ÿ'\-]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ'\-]+){{1,2}})\b"
+    )
+    for m in pat_narrative_en.finditer(text):
+        raw_t = (m.group(1) or "").strip()
+        raw_n = (m.group(2) or "").strip()
+        clean_n = clean_person_name(raw_n)
+        if is_valid_person_name(clean_n):
+            norm = clean_n.lower()
+            if norm not in seen and len(results) < 30:
+                seen.add(norm)
+                results.append({"name": clean_n, "title": raw_t or "Executive"})
+
+    for m in pat_narrative_fr.finditer(text):
+        raw_t = (m.group(1) or "").strip()
+        raw_n = (m.group(2) or "").strip()
+        clean_n = clean_person_name(raw_n)
+        if is_valid_person_name(clean_n):
+            norm = clean_n.lower()
+            if norm not in seen and len(results) < 30:
+                seen.add(norm)
+                results.append({"name": clean_n, "title": raw_t or "Fondateur / Dirigeant"})
+
     # 2. Multi-line pattern: Name on line N, Title on line N+1..N+5, OR Title on line N, Name on line N+1..N+4
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     title_sub_re = re.compile(rf"\b({title_words})\b", re.I)
@@ -905,9 +975,10 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
                     if i + offset >= len(lines):
                         break
                     cand_line = lines[i + offset]
-                    m_t = title_sub_re.search(cand_line)
-                    if m_t and not matched_title:
-                        matched_title = m_t.group(0).strip()
+                    if len(cand_line) <= 80:
+                        m_t = title_sub_re.search(cand_line)
+                        if m_t and not matched_title:
+                            matched_title = m_t.group(0).strip()
                     m_e = re.search(r"(?:mailto:)?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", cand_line)
                     if m_e and not matched_email:
                         matched_email = m_e.group(1).lower()
@@ -915,7 +986,7 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
                     if is_valid_person_name(cand_clean) and cand_clean.lower() != clean_norm:
                         break
 
-                if not matched_title:
+                if not matched_title and len(line) <= 80:
                     m_same = title_sub_re.search(line)
                     if m_same:
                         matched_title = m_same.group(0).strip()
@@ -1733,7 +1804,9 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
             "leadership", "management", "people", "ppl", "nos-gens", "gens", "board",
             "administrateurs", "conseil", "administration", "gouvernance", "directors",
             "executives", "partners", "associates", "dentiste", "docteur", "chirurgien",
-            "avocat", "notaire", "medecin", "médecin", "gestion", "membres", "dr-"
+            "avocat", "notaire", "medecin", "médecin", "gestion", "membres", "dr-",
+            "owner", "founder", "president", "presidence", "qui-sommes-nous", "quisommesnous",
+            "services", "practitioner", "doctor", "profile", "bio"
         )
 
         def is_priority_link(text_and_url: str) -> bool:
@@ -1766,23 +1839,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                     if full_url not in tier2_pages:
                         tier2_pages.append(full_url)
 
-        # Seed standard speculative paths for leadership, board, governance, medical, executive & contact pages
-        SPECULATIVE_SUBPATHS = [
-            "/a-propos", "/apropos", "/about",
-            "/equipe", "/notre-equipe", "/direction", "/team",
-            "/conseil-d-administration", "/conseil-administration",
-            "/contact", "/contactez-nous", "/nous-joindre"
-        ]
-        has_leadership_page = any(
-            any(k in p.lower() for k in ("equipe", "direction", "conseil", "people", "team", "leadership", "board", "executives", "staff", "dentiste", "docteur", "admin", "propos", "about"))
-            for p in tier1_pages
-        )
-        if len(tier1_pages) < 3 or not has_leadership_page:
-            for sub in SPECULATIVE_SUBPATHS:
-                spec_url = urljoin(base, sub)
-                if spec_url not in tier1_pages:
-                    tier1_pages.append(spec_url)
-
+        # Real internal link queue (priority / about / team / contact pages first, then other internal pages)
         crawl_queue: List[str] = [base] + tier1_pages + tier2_pages
         seen = set()
 
@@ -1796,9 +1853,11 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                 page_html = home_html
             else:
                 r = await osint_fetch(p)
+                if not r.get("ok", True) or (r.get("status", 200) >= 400):
+                    continue
                 page_html = unmask_cloudflare_emails(r.get("html", ""))
 
-            if not page_html:
+            if not page_html or len(page_html) < 200:
                 continue
 
             markdown_content = clean_html_to_markdown(page_html)
@@ -1861,6 +1920,8 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                         combo = (a.get_text() or "").lower() + " " + sub_href.lower()
                         if is_priority_link(combo):
                             crawl_queue.insert(0, sub_full)
+                        else:
+                            crawl_queue.append(sub_full)
 
             add_raw_source(
                 p, page_html,
