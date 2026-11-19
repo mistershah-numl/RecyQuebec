@@ -188,7 +188,7 @@ export type Evidence = {
   domain: string | null;
   emails: string[];
   phones: string[];
-  people: { name: string; title: string }[];
+  people: { name: string; title: string; email?: string | null; phone?: string | null }[];
   snippets: string[];
   pagesScraped: number;
   socials: {
@@ -400,7 +400,7 @@ export type WorkerOsintResult = {
   emails: string[];
   trustedEmails: string[];
   phones: string[];
-  people: { name: string; title: string }[];
+  people: { name: string; title: string; email?: string | null; phone?: string | null }[];
   domain: string | null;
   address: string | null;
   linkedin: string | null;
@@ -859,7 +859,7 @@ function collectPeople(text: string): { name: string; title: string; email?: str
     }
   }
 
-  // 2. Multi-line card pattern (Name on line N, Title on line N+1..N+3)
+  // 2. Multi-line card pattern (Name on line N, Title on line N+1..N+5, OR Title on line N, Name on line N+1..N+4)
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
   const titleSubRe = new RegExp(`\\b(${TITLE_WORDS})\\b`, "i");
 
@@ -867,32 +867,63 @@ function collectPeople(text: string): { name: string; title: string; email?: str
     const line = lines[i]!;
     const rawName = line.replace(/^#+\s*/, "").replace(/^\[([^\]]+)\].*$/, "$1").trim();
     const cleanName = cleanPersonName(rawName);
-    if (!isValidPersonName(cleanName)) continue;
-    const norm = cleanName.toLowerCase();
-    if (seen.has(norm)) continue;
 
-    let matchedTitle: string | null = null;
-    let matchedEmail: string | null = null;
-    for (let offset = 1; offset <= 3 && i + offset < lines.length; offset++) {
-      const candLine = lines[i + offset]!;
-      const mT = candLine.match(titleSubRe);
-      if (mT && !matchedTitle) matchedTitle = mT[0].trim();
-      const mE = candLine.match(/mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/i);
-      if (mE && !matchedEmail) matchedEmail = mE[1]!.toLowerCase();
-      const candClean = cleanPersonName(candLine.replace(/^#+\s*/, "").trim());
-      if (isValidPersonName(candClean) && candClean.toLowerCase() !== norm) break;
+    // Case A: Name on line i, Title on line i+1..i+5
+    if (isValidPersonName(cleanName)) {
+      const norm = cleanName.toLowerCase();
+      if (!seen.has(norm)) {
+        let matchedTitle: string | null = null;
+        let matchedEmail: string | null = null;
+        for (let offset = 1; offset <= 5 && i + offset < lines.length; offset++) {
+          const candLine = lines[i + offset]!;
+          const mT = candLine.match(titleSubRe);
+          if (mT && !matchedTitle) matchedTitle = mT[0].trim();
+          const mE = candLine.match(/(?:mailto:)?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/i);
+          if (mE && !matchedEmail) matchedEmail = mE[1]!.toLowerCase();
+          const candClean = cleanPersonName(candLine.replace(/^#+\s*/, "").trim());
+          if (isValidPersonName(candClean) && candClean.toLowerCase() !== norm) break;
+        }
+
+        if (!matchedTitle) {
+          const mSame = line.match(titleSubRe);
+          if (mSame) matchedTitle = mSame[0].trim();
+        }
+
+        if (matchedTitle && out.length < 30) {
+          seen.add(norm);
+          const item: { name: string; title: string; email?: string } = { name: cleanName, title: matchedTitle };
+          if (matchedEmail) item.email = matchedEmail;
+          out.push(item);
+        }
+      }
     }
 
-    if (!matchedTitle) {
-      const mSame = line.match(titleSubRe);
-      if (mSame) matchedTitle = mSame[0].trim();
-    }
-
-    if (matchedTitle && out.length < 30) {
-      seen.add(norm);
-      const item: { name: string; title: string; email?: string } = { name: cleanName, title: matchedTitle };
-      if (matchedEmail) item.email = matchedEmail;
-      out.push(item);
+    // Case B: Title on line i, Name on line i+1..i+4 (e.g. "Président \n Christian Rock")
+    const titleOnlyMatch = line.match(new RegExp(`^\\s*(${TITLE_WORDS})\\s*$`, "i"));
+    if (titleOnlyMatch) {
+      const foundTitle = titleOnlyMatch[1]!.trim();
+      for (let offset = 1; offset <= 4 && i + offset < lines.length; offset++) {
+        const nextLine = lines[i + offset]!;
+        const candRaw = nextLine.replace(/^#+\s*/, "").replace(/^\[([^\]]+)\].*$/, "$1").trim();
+        const candClean = cleanPersonName(candRaw);
+        if (isValidPersonName(candClean)) {
+          const norm = candClean.toLowerCase();
+          if (!seen.has(norm) && out.length < 30) {
+            seen.add(norm);
+            let matchedEmail: string | null = null;
+            for (let subOffset = 1; subOffset <= 3 && i + offset + subOffset < lines.length; subOffset++) {
+              const subLine = lines[i + offset + subOffset]!;
+              const mE = subLine.match(/(?:mailto:)?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/i);
+              if (mE) {
+                matchedEmail = mE[1]!.toLowerCase();
+                break;
+              }
+            }
+            out.push({ name: candClean, title: foundTitle, ...(matchedEmail ? { email: matchedEmail } : {}) });
+          }
+          break;
+        }
+      }
     }
   }
 
@@ -916,6 +947,21 @@ const COMMON_PATHS = [
   "/equipe",
   "/notre-equipe",
   "/direction",
+  "/conseil-dadministration",
+  "/conseil-d-administration",
+  "/conseil-administration",
+  "/conseil",
+  "/administration",
+  "/administrateurs",
+  "/gouvernance",
+  "/gestion",
+  "/membres",
+  "/staff",
+  "/dentistes",
+  "/dentiste",
+  "/docteurs",
+  "/docteur",
+  "/professionnels",
   "/about/people",
   "/about/team",
   "/about/leadership",
@@ -1074,7 +1120,7 @@ async function registryLookup(
   address: string | null;
   phones: string[];
   emails: string[];
-  people: { name: string; title: string }[];
+  people: { name: string; title: string; email?: string | null; phone?: string | null }[];
   status: string | null;
   statusVotes: StatusVote[];
   statusSources: string[];
@@ -1489,7 +1535,18 @@ export async function gatherEvidence(
         texts.push(homeText);
         texts.push((home.match(/mailto:[^"'>\s]+/gi) ?? []).join(" "));
 
-        for (const m of home.matchAll(/href="([^"#]+)"/gi)) {
+        for (const m of home.matchAll(/<a\s+[^>]*href=["']([^"'#\s>]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+          const href = m[1]!.replace(/&amp;/g, "&");
+          const anchorText = m[2]!.replace(/<[^>]+>/g, " ").trim();
+          if (!CONTACT_HINT.test(href) && !CONTACT_HINT.test(anchorText)) continue;
+          try {
+            const abs = new URL(href, candidate).toString();
+            if (hostOf(abs) === domain) internal.add(abs);
+          } catch {
+            /* ignore */
+          }
+        }
+        for (const m of home.matchAll(/href\s*=\s*["']([^"'#\s>]+)["']/gi)) {
           const href = m[1]!.replace(/&amp;/g, "&");
           if (!CONTACT_HINT.test(href)) continue;
           try {
@@ -1534,7 +1591,20 @@ export async function gatherEvidence(
 
         // Recursive internal link discovery on crawled pages (e.g. /staff/dr-...)
         const pageUrl = urls[i] ?? candidate ?? `https://${domain}`;
-        for (const m of page.matchAll(/href="([^"#]+)"/gi)) {
+        for (const m of page.matchAll(/<a\s+[^>]*href=["']([^"'#\s>]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+          const href = m[1]!.replace(/&amp;/g, "&");
+          const anchorText = m[2]!.replace(/<[^>]+>/g, " ").trim();
+          if (!CONTACT_HINT.test(href) && !CONTACT_HINT.test(anchorText)) continue;
+          try {
+            const abs = new URL(href, pageUrl).toString();
+            if (hostOf(abs) === domain && !internal.has(abs) && !secondaryUrls.includes(abs)) {
+              secondaryUrls.push(abs);
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        for (const m of page.matchAll(/href\s*=\s*["']([^"'#\s>]+)["']/gi)) {
           const href = m[1]!.replace(/&amp;/g, "&");
           if (!CONTACT_HINT.test(href)) continue;
           try {

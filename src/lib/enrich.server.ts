@@ -191,7 +191,7 @@ Rules:
   directory or unrelated business (amazon.com, google.com, wix, shopify, godaddy…).
 - Return null only for the fields you genuinely do not know; still fill the ones you do.
 - "source" must describe where each value comes from (e.g. "company website + CMEQ licence page").
-Answer with STRICT JSON only: {"domain":string|null,"website":string|null,"executive_name":string|null,"title":string|null,"email":string|null,"phone":string|null,"address":string|null,"source":string}`;
+Answer with STRICT JSON only: {"domain":string|null,"website":string|null,"executive_name":string|null,"title":string|null,"email":string|null,"phone":string|null,"address":string|null,"source":string,"people":[{"name":string,"title":string,"email":string|null,"phone":string|null}]}`;
 
 
 /** Cache of "requested Gemini model -> model that actually exists on this key". */
@@ -729,6 +729,14 @@ function emailMatchesPerson(email: string, person: { name: string }): boolean {
   return false;
 }
 
+export function isGenericRoleEmail(email: string | null | undefined): boolean {
+  if (!email || !email.includes("@")) return false;
+  const local = (email.split("@")[0] || "").toLowerCase();
+  return /^(info|contact|admin|support|service|services|ventes|sales|reception|facturation|billing|inquiry|general|bureau|accueil|courriel|email)$/.test(
+    local,
+  );
+}
+
 /**
  * Higher tier = closer to a confirmed executive or verified company mailbox.
  * Executive-first hierarchy:
@@ -1209,22 +1217,36 @@ export async function enrichCompany(
   }
 
   const aiMinScore = Math.max(0, Math.min(5, Number(targets.aiFallbackMinScore ?? 0) || 0));
+  const chosenPerson =
+    (best ? evidence.people.find((p) => looksPersonal(best.cand.email, [p])) : null) ?? person;
+  const hasExecutive = Boolean(chosenPerson?.name);
+
+  // If OSINT only found a generic department mailbox (info@, contact@) without a named executive,
+  // do NOT terminate early if AI fallback is enabled — escalate to discover the named decision-maker!
   const osintGoodEnough =
-    !!best && best.assessment.status !== "Unverified" && best.assessment.confidence >= aiMinScore;
+    !!best &&
+    best.assessment.status !== "Unverified" &&
+    best.assessment.confidence >= aiMinScore &&
+    (hasExecutive || targets.useAiFallback === false);
+
   if (best && best.assessment.status !== "Unverified" && !osintGoodEnough) {
-    await onStep(
-      `OSINT score ${best.assessment.confidence}/5 is below the AI threshold (${aiMinScore}/5) — escalating to the AI agent`,
-      "warn",
-    );
+    if (!hasExecutive && targets.useAiFallback !== false) {
+      await onStep(
+        `OSINT found institutional mailbox (${best.cand.email}) without a named executive — escalating to AI to discover decision-maker`,
+        "warn",
+      );
+    } else {
+      await onStep(
+        `OSINT score ${best.assessment.confidence}/5 is below the AI threshold (${aiMinScore}/5) — escalating to the AI agent`,
+        "warn",
+      );
+    }
   }
   if (osintGoodEnough) {
     await onStep(
-      `Accepted without AI: ${best!.cand.email} (${best!.assessment.status} · ${best!.assessment.confidence}/5 ≥ threshold ${aiMinScore}/5)`,
+      `Accepted without AI: ${best!.cand.email} (${best!.assessment.status} · ${best!.assessment.confidence}/5 ≥ threshold ${aiMinScore}/5)${chosenPerson ? ` · Executive: ${chosenPerson.name}` : ""}`,
       "success",
     );
-
-    const chosenPerson =
-      evidence.people.find((p) => looksPersonal(best!.cand.email, [p])) ?? person;
 
     const additional_executives = buildAdditionalExecutives(
       evidence.people,
@@ -1323,10 +1345,11 @@ Needed: ${need}`;
   const queries = [
     `"${clean}" ${city} Québec`,
     inputTradeNames.length ? `"${inputTradeNames[0]}" ${city} Québec` : null,
+    `"${searchName}" (président OR propriétaire OR directeur OR dentiste OR direction OR fondat OR ceo)`,
     `"${searchName}" ${city} téléphone adresse contact`,
     `"${searchName}" courriel OR email OR contact`,
     `"${searchName}" site officiel OR website`,
-    row.neq ? `"${row.neq}" ${clean}` : `"${searchName}" pagesjaunes OR canada411 OR linkedin`,
+    row.neq ? `"${row.neq}" ${clean} dirigeants OR administrateurs` : `"${searchName}" pagesjaunes OR canada411 OR linkedin`,
   ].filter((q): q is string => Boolean(q));
   let liveLinks: string[] = [];
   let liveSnippets: string[] = [];
@@ -1401,6 +1424,24 @@ Likely own-domain shapes: ${guessBases.join(", ")} (with .ca / .com / .qc.ca).`;
     const v = ai[field];
     return typeof v === "string" && v.trim() ? v.trim() : null;
   };
+
+  const aiPeopleRaw = Array.isArray(ai["people"]) ? (ai["people"] as any[]) : [];
+  for (const ap of aiPeopleRaw) {
+    if (ap && typeof ap.name === "string" && ap.name.trim()) {
+      const cleanName = cleanPersonName(ap.name);
+      if (isValidPersonName(cleanName)) {
+        if (!evidence.people.some((ep) => ep.name.toLowerCase() === cleanName.toLowerCase())) {
+          evidence.people.push({
+            name: cleanName,
+            title: typeof ap.title === "string" ? ap.title.trim() : "Executive",
+            email: typeof ap.email === "string" ? ap.email.trim() : undefined,
+            phone: typeof ap.phone === "string" ? ap.phone.trim() : undefined,
+          });
+        }
+      }
+    }
+  }
+
   const rawAiEmail = aiText("email")?.toLowerCase() ?? null;
   let aiEmail = rawAiEmail && !isVendorDomain(rawAiEmail.split("@")[1] ?? "") ? rawAiEmail : null;
   if (rawAiEmail && !aiEmail)
@@ -1440,43 +1481,51 @@ Likely own-domain shapes: ${guessBases.join(", ")} (with .ca / .com / .qc.ca).`;
   let details: Record<string, unknown> = { reasons: ["No email produced"] };
 
   if (email) {
-    const assessment = await assessEmail(email, {
-      ...baseCtx,
-      companyDomain,
-      origin: email === aiEmail && email !== scrapedEmail && !siteFound?.emails.includes(email) ? "ai" : "web",
-    }, signal);
-    verification = assessment.status;
-    confidence = assessment.confidence;
-    emailType = assessment.email_type;
-    details = { signals: assessment.signals, reasons: assessment.reasons };
-    await onStep(
-      `AI proposed ${email} → ${assessment.status} · score ${assessment.confidence}/5 · ${assessment.reasons.join("; ")}`,
-      assessment.status === "Invalid" ? "warn" : "info",
-    );
-    // Never trust an AI address without an independent web trace.
-    if (assessment.status !== "Invalid") {
-      try {
-        const rev = await reverseLookup(email, "email", { ...companyRef, domain: domain ?? evidence.domain }, signal);
-        details = { ...details, reverse_email: rev };
-        if (rev.matched) {
-          confidence = Math.min(5, confidence + (rev.confirmations >= 2 ? 2 : 1));
-          verification = "Verified";
-          await onStep(`Reverse check confirmed AI email via ${rev.sources.join(", ") || "web search"}`, "success");
-        } else if (rev.conflicting) {
-          confidence = Math.max(0, confidence - 2);
-          verification = "Unverified";
-          await onStep("Reverse check: AI email is used by other businesses — downgraded", "warn");
-        } else if (email === aiEmail && email !== scrapedEmail && !siteFound?.emails.includes(email)) {
-          // AI-proposed address with no independent web trace: keep it, but never
-          // present it as verified or high-confidence.
-          confidence = Math.min(confidence, 2);
-          verification = "Unverified";
-          await onStep("Reverse check: no public page links the AI email to this company — kept as unverified", "warn");
-        } else {
-          await onStep("Reverse check: no public page links this email to this company", "warn");
+    if (best && email.toLowerCase() === best.cand.email.toLowerCase()) {
+      verification = best.assessment.status;
+      confidence = best.assessment.confidence;
+      emailType = best.assessment.email_type;
+      details = { signals: best.assessment.signals, reasons: best.assessment.reasons };
+      await onStep(`Retained verified OSINT email ${email} (${verification} · ${confidence}/5)`, "success");
+    } else {
+      const assessment = await assessEmail(email, {
+        ...baseCtx,
+        companyDomain,
+        origin: email === aiEmail && email !== scrapedEmail && !siteFound?.emails.includes(email) ? "ai" : "web",
+      }, signal);
+      verification = assessment.status;
+      confidence = assessment.confidence;
+      emailType = assessment.email_type;
+      details = { signals: assessment.signals, reasons: assessment.reasons };
+      await onStep(
+        `AI proposed ${email} → ${assessment.status} · score ${assessment.confidence}/5 · ${assessment.reasons.join("; ")}`,
+        assessment.status === "Invalid" ? "warn" : "info",
+      );
+      // Never trust an AI address without an independent web trace.
+      if (assessment.status !== "Invalid") {
+        try {
+          const rev = await reverseLookup(email, "email", { ...companyRef, domain: domain ?? evidence.domain }, signal);
+          details = { ...details, reverse_email: rev };
+          if (rev.matched) {
+            confidence = Math.min(5, confidence + (rev.confirmations >= 2 ? 2 : 1));
+            verification = "Verified";
+            await onStep(`Reverse check confirmed AI email via ${rev.sources.join(", ") || "web search"}`, "success");
+          } else if (rev.conflicting) {
+            confidence = Math.max(0, confidence - 2);
+            verification = "Unverified";
+            await onStep("Reverse check: AI email is used by other businesses — downgraded", "warn");
+          } else if (email === aiEmail && email !== scrapedEmail && !siteFound?.emails.includes(email)) {
+            // AI-proposed address with no independent web trace: keep it, but never
+            // present it as verified or high-confidence.
+            confidence = Math.min(confidence, 2);
+            verification = "Unverified";
+            await onStep("Reverse check: no public page links the AI email to this company — kept as unverified", "warn");
+          } else {
+            await onStep("Reverse check: no public page links this email to this company", "warn");
+          }
+        } catch {
+          /* best effort */
         }
-      } catch {
-        /* best effort */
       }
     }
 
@@ -1490,7 +1539,11 @@ Likely own-domain shapes: ${guessBases.join(", ")} (with .ca / .com / .qc.ca).`;
     `AI answer — domain ${aiDomain ?? "none"} · phone ${aiText("phone") ?? "none"} · address ${aiText("address") ?? "none"} · ${aiText("source") ?? "no source"}`,
   );
 
-  const primaryExecutive = aiText("executive_name") ?? person?.name ?? null;
+  const primaryExecutive = aiText("executive_name") ?? person?.name ?? (evidence.people[0]?.name ?? null);
+  const primaryTitle = aiText("title") ?? person?.title ?? (evidence.people[0]?.title ?? null);
+  if (primaryExecutive) {
+    await onStep(`Executive candidate identified: ${primaryExecutive}${primaryTitle ? ` — ${primaryTitle}` : ""}`, "success");
+  }
   const primaryExecutiveEmail = verification === "Invalid" ? null : email;
   const additional_executives = buildAdditionalExecutives(
     evidence.people,
@@ -1506,7 +1559,7 @@ Likely own-domain shapes: ${guessBases.join(", ")} (with .ca / .com / .qc.ca).`;
     address:
       targets.address === false ? null : (evidence.address ?? siteFound?.address ?? aiText("address")),
     executive_name: primaryExecutive,
-    title: aiText("title") ?? person?.title ?? null,
+    title: primaryTitle,
     email: primaryExecutiveEmail,
     phone: phone ?? (targets.phone === false ? null : (siteFound?.phones[0] ?? aiText("phone"))),
     domain: targets.domain === false ? null : domain,

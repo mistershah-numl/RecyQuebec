@@ -791,7 +791,7 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
                 seen.add(clean_norm)
                 results.append({"name": clean_name, "title": raw_title})
 
-    # 2. Multi-line pattern: Name on line N, Title on line N+1..N+3 (common in web cards / profiles)
+    # 2. Multi-line pattern: Name on line N, Title on line N+1..N+5, OR Title on line N, Name on line N+1..N+4
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     title_sub_re = re.compile(rf"\b({title_words})\b", re.I)
 
@@ -799,40 +799,69 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
         raw_name = re.sub(r"^#+\s*", "", line).strip()
         raw_name = re.sub(r"^\[([^\]]+)\].*$", r"\1", raw_name).strip()
         clean_name = clean_person_name(raw_name)
-        if not is_valid_person_name(clean_name):
-            continue
-        clean_norm = clean_name.lower()
-        if clean_norm in seen:
-            continue
 
-        matched_title = None
-        matched_email = None
-        for offset in range(1, 4):
-            if i + offset >= len(lines):
-                break
-            cand_line = lines[i + offset]
-            m_t = title_sub_re.search(cand_line)
-            if m_t and not matched_title:
-                matched_title = m_t.group(0).strip()
-            m_e = re.search(r"mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", cand_line)
-            if m_e and not matched_email:
-                matched_email = m_e.group(1).lower()
-            cand_clean = clean_person_name(re.sub(r"^#+\s*", "", cand_line).strip())
-            if is_valid_person_name(cand_clean) and cand_clean.lower() != clean_norm:
-                break
+        # Case A: Name on line i, Title on line i+1..i+5
+        if is_valid_person_name(clean_name):
+            clean_norm = clean_name.lower()
+            if clean_norm not in seen:
+                matched_title = None
+                matched_email = None
+                for offset in range(1, 6):
+                    if i + offset >= len(lines):
+                        break
+                    cand_line = lines[i + offset]
+                    m_t = title_sub_re.search(cand_line)
+                    if m_t and not matched_title:
+                        matched_title = m_t.group(0).strip()
+                    m_e = re.search(r"(?:mailto:)?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", cand_line)
+                    if m_e and not matched_email:
+                        matched_email = m_e.group(1).lower()
+                    cand_clean = clean_person_name(re.sub(r"^#+\s*", "", cand_line).strip())
+                    if is_valid_person_name(cand_clean) and cand_clean.lower() != clean_norm:
+                        break
 
-        # Also check if title was directly in the line itself (e.g. [Dr Anthony MikhayelDentiste](/staff/...))
-        if not matched_title:
-            m_same = title_sub_re.search(line)
-            if m_same:
-                matched_title = m_same.group(0).strip()
+                # Also check if title was directly in the line itself (e.g. [Dr Anthony MikhayelDentiste](/staff/...))
+                if not matched_title:
+                    m_same = title_sub_re.search(line)
+                    if m_same:
+                        matched_title = m_same.group(0).strip()
 
-        if matched_title and len(results) < 30:
-            seen.add(clean_norm)
-            item = {"name": clean_name, "title": matched_title}
-            if matched_email:
-                item["email"] = matched_email
-            results.append(item)
+                if matched_title and len(results) < 30:
+                    seen.add(clean_norm)
+                    item = {"name": clean_name, "title": matched_title}
+                    if matched_email:
+                        item["email"] = matched_email
+                    results.append(item)
+
+        # Case B: Title on line i, Name on line i+1..i+4 (e.g. "Président \n Christian Rock")
+        title_only_match = re.match(rf"^\s*({title_words})\s*$", line, re.I)
+        if title_only_match:
+            found_title = title_only_match.group(1).strip()
+            for offset in range(1, 5):
+                if i + offset >= len(lines):
+                    break
+                next_line = lines[i + offset]
+                cand_raw = re.sub(r"^#+\s*", "", next_line).strip()
+                cand_raw = re.sub(r"^\[([^\]]+)\].*$", r"\1", cand_raw).strip()
+                cand_clean = clean_person_name(cand_raw)
+                if is_valid_person_name(cand_clean):
+                    clean_norm = cand_clean.lower()
+                    if clean_norm not in seen and len(results) < 30:
+                        seen.add(clean_norm)
+                        matched_email = None
+                        for sub_offset in range(1, 4):
+                            if i + offset + sub_offset >= len(lines):
+                                break
+                            sub_line = lines[i + offset + sub_offset]
+                            m_e = re.search(r"(?:mailto:)?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", sub_line)
+                            if m_e:
+                                matched_email = m_e.group(1).lower()
+                                break
+                        item = {"name": cand_clean, "title": found_title}
+                        if matched_email:
+                            item["email"] = matched_email
+                        results.append(item)
+                    break
 
     return results
 
@@ -1446,14 +1475,19 @@ async def _osint_impl(body: OsintIn):
                     if full_url not in tier2_pages:
                         tier2_pages.append(full_url)
 
-        # If homepage provided few leadership/contact links, seed standard speculative paths
-        if len(tier1_pages) < 3:
-            SPECULATIVE_SUBPATHS = [
-                "/a-propos", "/contact", "/contactez-nous", "/nous-joindre",
-                "/conseil-dadministration", "/equipe", "/notre-equipe",
-                "/direction", "/people", "/team", "/leadership", "/board",
-                "/directors", "/executives", "/staff", "/about"
-            ]
+        # Seed standard speculative paths for leadership, board, governance, medical, executive & contact pages
+        SPECULATIVE_SUBPATHS = [
+            "/conseil-dadministration", "/conseil-d-administration", "/conseil-administration", "/conseil",
+            "/equipe", "/notre-equipe", "/direction", "/people", "/team", "/our-team", "/our-people",
+            "/leadership", "/board", "/directors", "/executives", "/staff", "/administrateurs",
+            "/gouvernance", "/gestion", "/membres", "/dentistes", "/dentiste", "/notre-equipe-dentaire",
+            "/docteurs", "/docteur", "/practitioners", "/a-propos", "/contact", "/contactez-nous", "/nous-joindre"
+        ]
+        has_leadership_page = any(
+            any(k in p.lower() for k in ("equipe", "direction", "conseil", "people", "team", "leadership", "board", "executives", "staff", "dentiste", "docteur", "admin"))
+            for p in tier1_pages
+        )
+        if len(tier1_pages) < 4 or not has_leadership_page:
             for sub in SPECULATIVE_SUBPATHS:
                 spec_url = urljoin(base, sub)
                 if spec_url not in tier1_pages:
@@ -1636,6 +1670,26 @@ async def _osint_impl(body: OsintIn):
                 log.append(f"{social_key}: Rejected non-matching search results")
         except Exception as e:
             log.append(f"{social_key} search failed: {e}")
+
+    # 5b. Targeted Executive Reconnaissance Search (if no executive identified yet)
+    if not people:
+        try:
+            exec_query = f'"{clean_name}" (président OR propriétaire OR directeur OR dentiste OR dirigeant OR fondateur)'
+            exec_hits = await search(f"https://duckduckgo.com/html/?q={quote_plus(exec_query)}")
+            for candidate_url in exec_hits[:3]:
+                candidate = await osint_fetch(candidate_url, wait_ms=600)
+                candidate_html = unmask_cloudflare_emails(candidate.get("html", ""))
+                candidate_text = clean_html_to_markdown(candidate_html)
+                if trusted_company_page(candidate_text, candidate_url, company_name, body.neq, domain):
+                    found_execs = extract_people_from_markdown(candidate_text)
+                    for fe in found_execs:
+                        if not any(x["name"].lower() == fe["name"].lower() for x in people):
+                            people.append(fe)
+                            log.append(f"Public search executive identified: {fe['name']} ({fe.get('title')})")
+                    if people:
+                        break
+        except Exception as e:
+            log.append(f"Executive search failed: {e}")
 
     # 6. User Custom Target Sites
     for extra in targets:
