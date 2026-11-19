@@ -52,14 +52,18 @@ NON_NAME_WORDS = {
     "useful", "terms", "policy", "privacy", "cookies", "legal", "copyright", "rights", "reserved",
     "open", "roles", "case", "studies", "insights", "services", "expertise", "people", "team",
     "executive", "board", "chair", "trust", "group", "holdings", "associates", "consultants",
-    "as", "pro", "or", "for", "and", "the", "our",
+    "as", "pro", "or", "for", "and", "the", "our", "votre", "notre", "equipe", "équipe",
+    "clinique", "dentaire", "centre", "cabinet", "bureau", "conseil", "administration", "gouvernance",
+    "direction", "membres", "personnel", "staff",
 }
 
 
 def clean_person_name(raw: str) -> str:
-    name = re.sub(r"^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s+", "", raw, flags=re.I).strip()
+    name = re.sub(r"^#+\s*", "", raw).strip()
+    name = re.sub(r"^\[([^\]]+)\].*$", r"\1", name).strip()
+    name = re.sub(r"^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*", "", name, flags=re.I).strip()
     name = re.sub(
-        r"\s+(?:vice|président|directeur|directrice|president|ceo|owner|fondateur|associé|gérant|chief|partner|director)$",
+        r"\s*(?:vice|président(?:e)?|directeur|directrice|president|ceo|owner|fondateur|fondatrice|associé(?:e)?|gérant(?:e)?|chief|partner|director|dentiste|chirurgien(?:ne)?|docteur(?:e)?|médecin|avocat(?:e)?|notaire|comptable|gestionnaire|administrateur|administratrice)$",
         "",
         name,
         flags=re.IGNORECASE,
@@ -95,14 +99,16 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
     # Title words - French & English executive titles
     title_words = (
         r"(?:Président(?:e)?(?:[- ]Directeur[- ]Général)?|Vice[- ]Président(?:e)?|"
-        r"Directeur(?:trice)?(?:\s+Général(?:e)?|\s+d'[ée]tudes|\s+des\s+[ée]tudes)?|"
-        r"Propriétaire|Fondateur|Fondatrice|Associé(?:e)?|Gérant(?:e)?|Administrateur(?:trice)?|"
-        r"Recteur|Rectrice|Doyen(?:ne)?|Principal(?:e)?|Provost|Chancellor|Coordonnateur(?:trice)?|"
-        r"Secrétaire(?:\s+Général(?:e)?)?|Trésorier(?:ière)?|DG|PDG|"
+        r"Direct(?:eur|rice)(?:\s+Général(?:e)?|\s+d'[ée]tudes|\s+des\s+[ée]tudes)?|"
+        r"Propriétaire|Fondat(?:eur|rice)|Associé(?:e)?|Gérant(?:e)?|Administrat(?:eur|rice)|"
+        r"Recteur|Rectrice|Doyen(?:ne)?|Principal(?:e)?|Provost|Chancellor|Coordonnat(?:eur|rice)|"
+        r"Secrétaire(?:\s+Général(?:e)?|[- /]Tr[ée]sorier(?:i[èe]re)?)?|Trésorier(?:ière)?|DG|PDG|"
         r"Chief Executive Officer|CEO|CFO|COO|CTO|CMO|CRO|President|Owner|Founder|"
-        r"General Manager|Managing Director|Partner|Executive Director|Director|VP|Vice[- ]President)"
+        r"General Manager|Managing Director|Partner|Executive Director|Director|VP|Vice[- ]President|"
+        r"Dentiste|Chirurgien(?:ne)?(?:\s+Dentiste)?|Docteur(?:e)?|Dr|Médecin|Avocat(?:e)?|Notaire|Comptable|Gestionnaire)"
     )
 
+    # 1. Inline pattern: "Name, Title" or "Title: Name"
     pats = [
         re.compile(rf"{name_pat}[ \t]*[,–—\-][ \t]*((?i:{title_words}))"),
         re.compile(rf"((?i:{title_words}))[ \t]*[:,–—\-][ \t]*{name_pat}"),
@@ -116,9 +122,53 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
             if not is_valid_person_name(clean_name):
                 continue
             clean_norm = clean_name.lower()
-            if clean_norm not in seen and len(results) < 25:
+            if clean_norm not in seen and len(results) < 30:
                 seen.add(clean_norm)
                 results.append({"name": clean_name, "title": raw_title})
+
+    # 2. Multi-line pattern: Name on line N, Title on line N+1..N+3 (common in web cards / profiles)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    title_sub_re = re.compile(rf"\b({title_words})\b", re.I)
+
+    for i, line in enumerate(lines):
+        raw_name = re.sub(r"^#+\s*", "", line).strip()
+        raw_name = re.sub(r"^\[([^\]]+)\].*$", r"\1", raw_name).strip()
+        clean_name = clean_person_name(raw_name)
+        if not is_valid_person_name(clean_name):
+            continue
+        clean_norm = clean_name.lower()
+        if clean_norm in seen:
+            continue
+
+        matched_title = None
+        matched_email = None
+        for offset in range(1, 4):
+            if i + offset >= len(lines):
+                break
+            cand_line = lines[i + offset]
+            m_t = title_sub_re.search(cand_line)
+            if m_t and not matched_title:
+                matched_title = m_t.group(0).strip()
+            m_e = re.search(r"mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", cand_line)
+            if m_e and not matched_email:
+                matched_email = m_e.group(1).lower()
+            cand_clean = clean_person_name(re.sub(r"^#+\s*", "", cand_line).strip())
+            if is_valid_person_name(cand_clean) and cand_clean.lower() != clean_norm:
+                break
+
+        # Also check if title was directly in the line itself (e.g. [Dr Anthony MikhayelDentiste](/staff/...))
+        if not matched_title:
+            m_same = title_sub_re.search(line)
+            if m_same:
+                matched_title = m_same.group(0).strip()
+
+        if matched_title and len(results) < 30:
+            seen.add(clean_norm)
+            item = {"name": clean_name, "title": matched_title}
+            if matched_email:
+                item["email"] = matched_email
+            results.append(item)
+
     return results
 
 
@@ -432,6 +482,60 @@ class TestPeopleEmailLinking(unittest.TestCase):
         ]
         for valid in valid_examples:
             self.assertTrue(is_valid_person_name(valid), f"'{valid}' should be accepted as a person name")
+
+    def test_ntetemuk_board_multiline_extraction(self):
+        """Test multi-line board of directors extraction as seen on ntetemuk.com/conseil-dadministration."""
+        markdown = """
+        # Conseil Administratif
+
+        #### Josiane Hervieux Bacon
+        Administrateur
+        [josiane.bacon@ntetemuk.com](mailto:josiane.bacon@ntetemuk.com)
+
+        #### Juliette Rock
+        Secrétaire/Trésorière
+
+        #### Véronique Bacon
+        Administratrice
+
+        #### Linda Rock
+        Administratrice
+
+        #### Christian Rock
+        Président
+        [christian.rock@ntetemuk.com](mailto:christian.rock@ntetemuk.com)
+
+        #### Yolande Simon
+        administratrice
+
+        #### Richard Hervieux
+        administrateur
+        """
+        people = extract_people_from_markdown(markdown)
+        extracted_names = [p["name"] for p in people]
+        self.assertIn("Josiane Hervieux Bacon", extracted_names)
+        self.assertIn("Christian Rock", extracted_names)
+        self.assertIn("Juliette Rock", extracted_names)
+        self.assertIn("Véronique Bacon", extracted_names)
+        self.assertIn("Richard Hervieux", extracted_names)
+
+        # Check emails attached
+        josiane = next(p for p in people if p["name"] == "Josiane Hervieux Bacon")
+        self.assertEqual(josiane.get("email"), "josiane.bacon@ntetemuk.com")
+        christian = next(p for p in people if p["name"] == "Christian Rock")
+        self.assertEqual(christian.get("email"), "christian.rock@ntetemuk.com")
+
+    def test_dentistesvdb_staff_extraction(self):
+        """Test doctor and staff extraction with concatenated titles as seen on dentistesvdb.ca/a-propos."""
+        markdown = """
+        #### Votre Équipe
+        [Dr Anthony MikhayelDentiste](/staff/dr-anthony-mikhayel)
+        [Dr Adika DogbéDentiste](/staff/dr-adika-dogbe)
+        """
+        people = extract_people_from_markdown(markdown)
+        extracted_names = [p["name"] for p in people]
+        self.assertIn("Anthony Mikhayel", extracted_names)
+        self.assertIn("Adika Dogbé", extracted_names)
 
 
 if __name__ == "__main__":

@@ -1831,11 +1831,6 @@ export async function processJobBatch(
           const seenEmailsForThisCompany = new Set<string>();
           // Track emails already stored for this company in this batch
           if (result.email) seenEmailsForThisCompany.add(result.email.toLowerCase());
-          if (result.additional_executives) {
-            for (const existing of result.additional_executives) {
-              if (existing.email) seenEmailsForThisCompany.add(existing.email.toLowerCase());
-            }
-          }
 
           for (const exec of result.additional_executives.slice(0, 10)) {
             if (!exec.name) continue;
@@ -1901,7 +1896,7 @@ export async function processJobBatch(
               executive_name: exec.name,
               title: exec.title || result.title,
               email: exec.email,
-              phone: exec.phone || result.phone,
+              phone: exec.phone || null,
               domain: result.domain,
               verification_status: exec.status,
               confidence: exec.confidence,

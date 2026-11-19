@@ -142,7 +142,14 @@ const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const PHONE_RE = /(?:\+?1[\s.-]?)?\(?([2-9]\d{2})\)?[\s.-]?(\d{3})[\s.-]?(\d{4})/g;
 
 const TITLE_WORDS =
-  "(?:pr[ée]sident(?:e)?(?:[- ]directeur[- ]g[ée]n[ée]ral)?|vice[- ]pr[ée]sident(?:e)?|directeur(?:trice)?(?:\\s+g[ée]n[ée]ral(?:e)?|\\s+d'[ée]tudes|\\s+des\\s+[ée]tudes)?|propri[ée]taire|fondateur|fondatrice|associ[ée]|g[ée]rant(?:e)?|administrateur(?:trice)?|recteur|rectrice|doyen(?:ne)?|principal(?:e)?|provost|chancellor|coordonnateur(?:trice)?|secr[ée]taire(?:\\s+g[ée]n[ée]ral(?:e)?)?|tr[ée]sorier(?:i[èe]re)?|dg|chief executive officer|ceo|cfo|coo|cto|cmo|cro|president|owner|founder|general manager|managing director|partner|executive director)";
+  "(?:pr[ée]sident(?:e)?(?:[- ]directeur[- ]g[ée]n[ée]ral)?|vice[- ]pr[ée]sident(?:e)?|" +
+  "direct(?:eur|rice)(?:\\s+g[ée]n[ée]ral(?:e)?|\\s+d'[ée]tudes|\\s+des\\s+[ée]tudes)?|" +
+  "propri[ée]taire|fondat(?:eur|rice)|associ[ée](?:e)?|g[ée]rant(?:e)?|administrat(?:eur|rice)|" +
+  "recteur|rectrice|doyen(?:ne)?|principal(?:e)?|provost|chancellor|coordonnat(?:eur|rice)|" +
+  "secr[ée]taire(?:\\s+g[ée]n[ée]ral(?:e)?|[- /]tr?[ée]sori[èe]re|[- /]tr?[ée]sorier)?|tr?[ée]sorier(?:i[èe]re)?|dg|pdg|" +
+  "chief executive officer|ceo|cfo|coo|cto|cmo|cro|president|owner|founder|" +
+  "general manager|managing director|partner|executive director|director|vp|vice[- ]president|" +
+  "dentiste|chirurgien(?:ne)?(?:\\s+dentiste)?|docteur(?:e)?|dr|m[ée]decin|avocat(?:e)?|notaire|comptable|gestionnaire)";
 
 export type OsintOptions = {
   /** Search engines + snippet mining (always on). */
@@ -774,12 +781,21 @@ const NON_NAME_WORDS = new Set([
   "open", "roles", "case", "studies", "insights", "services", "expertise", "people", "team",
   "executive", "board", "chair", "trust", "group", "holdings", "associates", "consultants",
   "as", "pro", "or", "for", "and", "the", "our", "dr", "mr", "mrs", "ms", "prof", "mme",
+  "notre", "votre", "equipe", "équipe", "clinique", "dentaire", "centre", "cabinet", "bureau",
+  "conseil", "administration", "gouvernance", "direction", "membres", "personnel", "staff",
+  "denturologiste", "hygiéniste", "hygieniste", "assistante", "assistant", "réceptionniste", "receptionniste",
+  "infirmier", "infirmière", "technicien", "technicienne"
 ]);
 
 export function cleanPersonName(raw: string): string {
   return raw
-    .replace(/^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s+/i, "")
-    .replace(/\s+(?:vice|pr[ée]sident(e)?|directeur|directrice|president|ceo|owner|fondateur|associ[ée]|g[ée]rant(e)?|chief|partner|director)$/i, "")
+    .replace(/^#+\s*/, "")
+    .replace(/^\[([^\]]+)\].*$/, "$1")
+    .replace(/^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*/i, "")
+    .replace(
+      /\s*(?:vice|pr[ée]sident(?:e)?|direct(?:eur|rice)|president|ceo|owner|fondat(?:eur|rice)|associ[ée](?:e)?|g[ée]rant(?:e)?|chief|partner|director|dentiste|chirurgien(?:ne)?|docteur(?:e)?|dr|m[ée]decin|avocat(?:e)?|notaire|comptable|gestionnaire|administrat(?:eur|rice)|denturologiste|hygi[ée]niste|assistante?|r[ée]ceptionniste)$/i,
+      "",
+    )
     .trim();
 }
 
@@ -797,31 +813,76 @@ export function isValidPersonName(name: string): boolean {
   return true;
 }
 
-/** Heuristic executive extraction: "Jean Tremblay, Président" / "Président : Jean Tremblay". */
-function collectPeople(text: string): { name: string; title: string }[] {
-  const out: { name: string; title: string }[] = [];
+/** Heuristic executive extraction: "Jean Tremblay, Président" / "Président : Jean Tremblay" / Multi-line Cards. */
+function collectPeople(text: string): { name: string; title: string; email?: string }[] {
+  const out: { name: string; title: string; email?: string }[] = [];
+  const seen = new Set<string>();
   const NAME = "([A-ZÀ-Ý][a-zà-ÿ'’-]+(?:[ \\t]+[A-ZÀ-Ý][a-zà-ÿ'’-]+){1,2})";
+
+  // 1. Inline patterns
   const patterns = [
-    new RegExp(`${NAME}[ \\t]*[,–—-]\\s*((?i:${TITLE_WORDS}))`, "gu"),
-    new RegExp(`((?i:${TITLE_WORDS}))\\s*[:,–—-][ \\t]*${NAME}`, "gu"),
+    new RegExp(`${NAME}[ \\t]*[,–—-]\\s*(${TITLE_WORDS})`, "gui"),
+    new RegExp(`(${TITLE_WORDS})\\s*[:,–—-][ \\t]*${NAME}`, "gui"),
   ];
   for (const [i, re] of patterns.entries()) {
     let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) && out.length < 25) {
+    while ((m = re.exec(text)) && out.length < 30) {
       const rawName = (i === 0 ? m[1] : m[2])?.trim();
       const title = (i === 0 ? m[2] : m[1])?.trim();
       if (!rawName || !title) continue;
       const cleanName = cleanPersonName(rawName);
-      if (isValidPersonName(cleanName) && !out.some((p) => p.name.toLowerCase() === cleanName.toLowerCase())) {
-        out.push({ name: cleanName, title });
+      if (isValidPersonName(cleanName)) {
+        const norm = cleanName.toLowerCase();
+        if (!seen.has(norm)) {
+          seen.add(norm);
+          out.push({ name: cleanName, title });
+        }
       }
     }
   }
+
+  // 2. Multi-line card pattern (Name on line N, Title on line N+1..N+3)
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const titleSubRe = new RegExp(`\\b(${TITLE_WORDS})\\b`, "i");
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const rawName = line.replace(/^#+\s*/, "").replace(/^\[([^\]]+)\].*$/, "$1").trim();
+    const cleanName = cleanPersonName(rawName);
+    if (!isValidPersonName(cleanName)) continue;
+    const norm = cleanName.toLowerCase();
+    if (seen.has(norm)) continue;
+
+    let matchedTitle: string | null = null;
+    let matchedEmail: string | null = null;
+    for (let offset = 1; offset <= 3 && i + offset < lines.length; offset++) {
+      const candLine = lines[i + offset]!;
+      const mT = candLine.match(titleSubRe);
+      if (mT && !matchedTitle) matchedTitle = mT[0].trim();
+      const mE = candLine.match(/mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/i);
+      if (mE && !matchedEmail) matchedEmail = mE[1]!.toLowerCase();
+      const candClean = cleanPersonName(candLine.replace(/^#+\s*/, "").trim());
+      if (isValidPersonName(candClean) && candClean.toLowerCase() !== norm) break;
+    }
+
+    if (!matchedTitle) {
+      const mSame = line.match(titleSubRe);
+      if (mSame) matchedTitle = mSame[0].trim();
+    }
+
+    if (matchedTitle && out.length < 30) {
+      seen.add(norm);
+      const item: { name: string; title: string; email?: string } = { name: cleanName, title: matchedTitle };
+      if (matchedEmail) item.email = matchedEmail;
+      out.push(item);
+    }
+  }
+
   return out;
 }
 
 const CONTACT_HINT =
-  /(contact|nous-joindre|nous_joindre|joindre|coordonnees|coordonn[ée]es|a-propos|apropos|about|equipe|[ée]quipe|team|direction|notre-entreprise|staff|leadership|management|people|ppl|nos-gens|gens|board|administrateurs|directors|executives|partners|associates)/i;
+  /(contact|nous-joindre|nous_joindre|joindre|coordonnees|coordonn[ée]es|a-propos|apropos|about|equipe|[ée]quipe|team|direction|notre-entreprise|staff|leadership|management|people|ppl|nos-gens|gens|board|administrateurs|directors|executives|partners|associates|conseil|administration|gouvernance|dentiste|docteur|chirurgien|avocat|notaire|medecin|m[ée]decin|gestion|membres)/i;
 
 const COMMON_PATHS = [
   "/people",
@@ -1395,27 +1456,58 @@ export async function gatherEvidence(
     if (domain) {
       const urls = Array.from(internal)
         .sort((a, b) => {
-          const aHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives)/i.test(a);
-          const bHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives)/i.test(b);
-          const aHasContact = /(contact|joindre|coordonnees)/i.test(a);
-          const bHasContact = /(contact|joindre|coordonnees)/i.test(b);
+          const aHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives|conseil|administration|gouvernance|staff|dentiste|docteur|dr-)/i.test(a);
+          const bHasPeople = /(people|ppl|leadership|team|equipe|direction|board|directors|executives|conseil|administration|gouvernance|staff|dentiste|docteur|dr-)/i.test(b);
+          const aHasContact = /(contact|joindre|coordonnees|a-propos|propos)/i.test(a);
+          const bHasContact = /(contact|joindre|coordonnees|a-propos|propos)/i.test(b);
           if (aHasPeople && !bHasPeople) return -1;
           if (!aHasPeople && bHasPeople) return 1;
           if (aHasContact && !bHasContact) return -1;
           if (!aHasContact && bHasContact) return 1;
           return 0;
         })
-        .slice(0, 14);
+        .slice(0, 35);
       const pages = await Promise.all(urls.map((u) => safeFetch(u, 7000)));
       pages.forEach((page, i) => {
         if (page && urls[i]) sourceUrls.push(urls[i]!);
       });
-      for (const page of pages) {
+      const secondaryUrls: string[] = [];
+      for (const [i, page] of pages.entries()) {
         if (!page) continue;
         pagesScraped++;
         texts.push(stripHtml(page).slice(0, 10_000));
         texts.push((page.match(/mailto:[^"'>\s]+/gi) ?? []).join(" "));
+
+        // Recursive internal link discovery on crawled pages (e.g. /staff/dr-...)
+        const pageUrl = urls[i] ?? candidate ?? `https://${domain}`;
+        for (const m of page.matchAll(/href="([^"#]+)"/gi)) {
+          const href = m[1]!.replace(/&amp;/g, "&");
+          if (!CONTACT_HINT.test(href)) continue;
+          try {
+            const abs = new URL(href, pageUrl).toString();
+            if (hostOf(abs) === domain && !internal.has(abs) && !secondaryUrls.includes(abs)) {
+              secondaryUrls.push(abs);
+            }
+          } catch {
+            /* ignore */
+          }
+        }
       }
+
+      // Fetch newly discovered secondary links up to page limit
+      if (secondaryUrls.length > 0 && pagesScraped < 35) {
+        const toFetch = secondaryUrls.slice(0, 35 - pagesScraped);
+        const secPages = await Promise.all(toFetch.map((u) => safeFetch(u, 7000)));
+        secPages.forEach((secPage, i) => {
+          if (secPage && toFetch[i]) {
+            sourceUrls.push(toFetch[i]!);
+            pagesScraped++;
+            texts.push(stripHtml(secPage).slice(0, 10_000));
+            texts.push((secPage.match(/mailto:[^"'>\s]+/gi) ?? []).join(" "));
+          }
+        });
+      }
+
       trail.push(`crawled ${pagesScraped} pages`);
     }
   }

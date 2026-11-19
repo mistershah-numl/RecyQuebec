@@ -62,7 +62,7 @@ HEADLESS = os.environ.get("HEADLESS", "1") != "0"
 NAV_TIMEOUT = int(os.environ.get("NAV_TIMEOUT_MS", "35000"))
 MAX_BROWSER_PAGES = max(1, min(8, int(os.environ.get("MAX_BROWSER_PAGES", "3"))))
 RENDER_TIMEOUT = max(10, min(90, int(os.environ.get("RENDER_TIMEOUT_SECONDS", "30"))))
-OSINT_TIMEOUT = max(30, min(300, int(os.environ.get("OSINT_TIMEOUT_SECONDS", "90"))))
+OSINT_TIMEOUT = max(30, min(300, int(os.environ.get("OSINT_TIMEOUT_SECONDS", "150"))))
 SMTP_TIMEOUT = max(10, min(120, int(os.environ.get("SMTP_TIMEOUT_SECONDS", "30"))))
 MAX_OSINT_BROWSER_FALLBACKS = max(0, min(6, int(os.environ.get("MAX_OSINT_BROWSER_FALLBACKS", "2"))))
 
@@ -74,7 +74,7 @@ UA = (
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:\+?1[\s.\-]?)?\(?([2-9]\d{2})\)?[\s.\-]?(\d{3})[\s.\-]?(\d{4})")
 EXEC_TITLE_RE = re.compile(
-    r"\b(Président|Présidente|Directeur Général|Directrice Générale|DG|Fondateur|Fondatrice|Propriétaire|CEO|President|Owner|Directeur|Directrice|VP|Vice-Président|Vice-Présidente|Partner|Associé|Associée|Managing Director|General Manager|Principal|Executive Director|Administrateur|Administratrice|Leader)\b",
+    r"\b(Président|Présidente|Directeur Général|Directrice Générale|DG|PDG|Fondateur|Fondatrice|Propriétaire|CEO|President|Owner|Directeur|Directrice|VP|Vice-Président|Vice-Présidente|Partner|Associé|Associée|Managing Director|General Manager|Principal|Executive Director|Administrateur|Administratrice|Leader|Dentiste|Chirurgien|Chirurgienne|Docteur|Docteure|Dr|Médecin|Avocat|Avocate|Notaire|Comptable|Gestionnaire|Secrétaire|Trésorier|Trésorière)\b",
     re.IGNORECASE,
 )
 LEGAL_SUFFIX_RE = re.compile(
@@ -534,14 +534,20 @@ NON_NAME_WORDS = {
     "useful", "terms", "policy", "privacy", "cookies", "legal", "copyright", "rights", "reserved",
     "open", "roles", "case", "studies", "insights", "services", "expertise", "people", "team",
     "executive", "board", "chair", "trust", "group", "holdings", "associates", "consultants",
-    "as", "pro", "or", "for", "and", "the", "our",
+    "as", "pro", "or", "for", "and", "the", "our", "votre", "notre", "equipe", "équipe",
+    "clinique", "dentaire", "centre", "cabinet", "bureau", "conseil", "administration", "gouvernance",
+    "direction", "membres", "personnel", "staff", "denturologiste", "hygiéniste", "hygieniste",
+    "assistante", "assistant", "réceptionniste", "receptionniste", "infirmier", "infirmière",
+    "technicien", "technicienne",
 }
 
 
 def clean_person_name(raw: str) -> str:
-    name = re.sub(r"^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s+", "", raw, flags=re.I).strip()
+    name = re.sub(r"^#+\s*", "", raw).strip()
+    name = re.sub(r"^\[([^\]]+)\].*$", r"\1", name).strip()
+    name = re.sub(r"^(?:Dr\.?|Mme\.?|Mr\.?|Ms\.?|Prof\.?)\s*", "", name, flags=re.I).strip()
     name = re.sub(
-        r"\s+(?:vice|président|directeur|directrice|president|ceo|owner|fondateur|associé|gérant|chief|partner|director)$",
+        r"\s*(?:vice|président(?:e)?|direct(?:eur|rice)|president|ceo|owner|fondat(?:eur|rice)|associé(?:e)?|gérant(?:e)?|chief|partner|director|dentiste|chirurgien(?:ne)?|docteur(?:e)?|dr|médecin|avocat(?:e)?|notaire|comptable|gestionnaire|administrat(?:eur|rice)|denturologiste|hygi[ée]niste|assistante?|r[ée]ceptionniste)$",
         "",
         name,
         flags=re.IGNORECASE,
@@ -572,27 +578,36 @@ def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
         results = []
         seen = set()
 
+        # 1. Specialized Executive, Leadership & Staff Card Containers
         selectors = [
+            "[data-ux='ContentCard']", "[data-ux='Card']",
             ".people__item", ".team__item", ".team-member", ".team-card", ".person-card",
             ".profile-card", "[class*='people__item']", "[class*='team-member']",
-            "[class*='person__card']", "[class*='member-card']"
+            "[class*='person__card']", "[class*='member-card']", "[class*='staff-member']",
+            "[class*='staff-card']", "[class*='doctor-card']", "[class*='dentist-card']",
+            "[class*='leadership-card']", "[class*='bio-card']", "[class*='board-member']"
         ]
         card_nodes = soup.select(", ".join(selectors))
         for card in card_nodes:
-            text = card.get_text("\n", strip=True)
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
-            if not lines:
-                continue
-            cand_name = clean_person_name(lines[0])
+            # First heading in the card is usually the person's name
+            heading = card.find(["h1", "h2", "h3", "h4", "h5", "h6", "strong"])
+            cand_raw = heading.get_text(strip=True) if heading else ""
+            if not cand_raw:
+                lines = [l.strip() for l in card.get_text("\n", strip=True).split("\n") if l.strip()]
+                cand_raw = lines[0] if lines else ""
+
+            cand_name = clean_person_name(cand_raw)
             if not is_valid_person_name(cand_name):
                 continue
             norm = cand_name.lower()
             if norm in seen:
                 continue
-            seen.add(norm)
 
-            title = lines[1] if len(lines) > 1 and len(lines[1]) < 60 else "Executive"
-            
+            # Look for an executive/professional title inside the card
+            card_text = card.get_text(" ", strip=True)
+            m_t = EXEC_TITLE_RE.search(card_text)
+            title = m_t.group(0).strip() if m_t else "Executive"
+
             email = None
             mail_a = card.select_one('a[href^="mailto:"]')
             if mail_a:
@@ -606,12 +621,68 @@ def extract_people_from_dom(html: str) -> List[Dict[str, Any]]:
             if tel_a:
                 phone = tel_a.get("href", "").replace("tel:", "").strip()
 
+            seen.add(norm)
             results.append({
                 "name": cand_name,
                 "title": title,
                 "email": email,
                 "phone": phone
             })
+
+        # 2. Dedicated Staff & Doctor Profile Links (e.g. /staff/dr-anthony-mikhayel)
+        staff_links = soup.find_all("a", href=re.compile(r"/(?:staff|equipe|team|dr-|people|leadership)/", re.I))
+        for a in staff_links:
+            link_text = a.get_text(" ", strip=True)
+            clean_l = clean_person_name(link_text)
+            if not is_valid_person_name(clean_l):
+                continue
+            norm = clean_l.lower()
+            if norm in seen:
+                continue
+
+            m_t = EXEC_TITLE_RE.search(link_text)
+            title = m_t.group(0).strip() if m_t else "Executive"
+            seen.add(norm)
+            results.append({
+                "name": clean_l,
+                "title": title,
+                "email": None,
+                "phone": None
+            })
+
+        # 3. Direct Mailto Containers: Check parent container for person names
+        for mail_a in soup.select('a[href^="mailto:"]'):
+            raw_href = mail_a.get("href", "")
+            cleaned_email = raw_href.replace("mailto:", "").split("?")[0].strip().lower()
+            if "@" not in cleaned_email or "." not in cleaned_email:
+                continue
+
+            # Look up to 3 parent elements for a person name heading
+            curr = mail_a.parent
+            for _ in range(3):
+                if not curr:
+                    break
+                heading = curr.find(["h1", "h2", "h3", "h4", "h5", "h6", "strong"])
+                if heading:
+                    h_clean = clean_person_name(heading.get_text(strip=True))
+                    if is_valid_person_name(h_clean):
+                        h_norm = h_clean.lower()
+                        # If already in results without email, update email
+                        existing = next((r for r in results if r["name"].lower() == h_norm), None)
+                        if existing and not existing.get("email"):
+                            existing["email"] = cleaned_email
+                        elif not existing and h_norm not in seen and len(results) < 30:
+                            m_t = EXEC_TITLE_RE.search(curr.get_text(" ", strip=True))
+                            seen.add(h_norm)
+                            results.append({
+                                "name": h_clean,
+                                "title": m_t.group(0).strip() if m_t else "Executive",
+                                "email": cleaned_email,
+                                "phone": None
+                            })
+                        break
+                curr = curr.parent
+
         return results
     except Exception:
         return []
@@ -625,13 +696,16 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
     name_pat = r"([A-ZÀ-Ý][a-zà-ÿ'\-]+(?:[ \t]+[A-ZÀ-Ý][a-zà-ÿ'\-]+){1,2})"
     title_words = (
         r"(?:Président(?:e)?(?:[- ]Directeur[- ]Général)?|Vice[- ]Président(?:e)?|"
-        r"Directeur(?:trice)?(?:\s+Général(?:e)?|\s+d'[ée]tudes|\s+des\s+[ée]tudes)?|"
-        r"Propriétaire|Fondateur|Fondatrice|Associé(?:e)?|Gérant(?:e)?|Administrateur(?:trice)?|"
-        r"Recteur|Rectrice|Doyen(?:ne)?|Principal(?:e)?|Provost|Chancellor|Coordonnateur(?:trice)?|"
-        r"Secrétaire(?:\s+Général(?:e)?)?|Trésorier(?:ière)?|DG|PDG|"
+        r"Direct(?:eur|rice)(?:\s+Général(?:e)?|\s+d'[ée]tudes|\s+des\s+[ée]tudes)?|"
+        r"Propriétaire|Fondat(?:eur|rice)|Associé(?:e)?|Gérant(?:e)?|Administrat(?:eur|rice)|"
+        r"Recteur|Rectrice|Doyen(?:ne)?|Principal(?:e)?|Provost|Chancellor|Coordonnat(?:eur|rice)|"
+        r"Secrétaire(?:\s+Général(?:e)?|[- /]Tr?[ée]sori[èe]re|[- /]Tr?[ée]sorier)?|Tr?[ée]sorier(?:i[èe]re)?|DG|PDG|"
         r"Chief Executive Officer|CEO|CFO|COO|CTO|CMO|CRO|President|Owner|Founder|"
-        r"General Manager|Managing Director|Partner|Executive Director|Director|VP|Vice[- ]President)"
+        r"General Manager|Managing Director|Partner|Executive Director|Director|VP|Vice[- ]President|"
+        r"Dentiste|Chirurgien(?:ne)?(?:\s+Dentiste)?|Docteur(?:e)?|Dr|Médecin|Avocat(?:e)?|Notaire|Comptable|Gestionnaire)"
     )
+
+    # 1. Inline pattern: "Name, Title" or "Title: Name"
     pats = [
         re.compile(rf"{name_pat}[ \t]*[,–—\-][ \t]*((?i:{title_words}))"),
         re.compile(rf"((?i:{title_words}))[ \t]*[:,–—\-][ \t]*{name_pat}"),
@@ -644,9 +718,53 @@ def extract_people_from_markdown(text: str) -> List[Dict[str, str]]:
             if not is_valid_person_name(clean_name):
                 continue
             clean_norm = clean_name.lower()
-            if clean_norm not in seen and len(results) < 25:
+            if clean_norm not in seen and len(results) < 30:
                 seen.add(clean_norm)
                 results.append({"name": clean_name, "title": raw_title})
+
+    # 2. Multi-line pattern: Name on line N, Title on line N+1..N+3 (common in web cards / profiles)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    title_sub_re = re.compile(rf"\b({title_words})\b", re.I)
+
+    for i, line in enumerate(lines):
+        raw_name = re.sub(r"^#+\s*", "", line).strip()
+        raw_name = re.sub(r"^\[([^\]]+)\].*$", r"\1", raw_name).strip()
+        clean_name = clean_person_name(raw_name)
+        if not is_valid_person_name(clean_name):
+            continue
+        clean_norm = clean_name.lower()
+        if clean_norm in seen:
+            continue
+
+        matched_title = None
+        matched_email = None
+        for offset in range(1, 4):
+            if i + offset >= len(lines):
+                break
+            cand_line = lines[i + offset]
+            m_t = title_sub_re.search(cand_line)
+            if m_t and not matched_title:
+                matched_title = m_t.group(0).strip()
+            m_e = re.search(r"mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", cand_line)
+            if m_e and not matched_email:
+                matched_email = m_e.group(1).lower()
+            cand_clean = clean_person_name(re.sub(r"^#+\s*", "", cand_line).strip())
+            if is_valid_person_name(cand_clean) and cand_clean.lower() != clean_norm:
+                break
+
+        # Also check if title was directly in the line itself (e.g. [Dr Anthony MikhayelDentiste](/staff/...))
+        if not matched_title:
+            m_same = title_sub_re.search(line)
+            if m_same:
+                matched_title = m_same.group(0).strip()
+
+        if matched_title and len(results) < 30:
+            seen.add(clean_norm)
+            item = {"name": clean_name, "title": matched_title}
+            if matched_email:
+                item["email"] = matched_email
+            results.append(item)
+
     return results
 
 
@@ -899,7 +1017,7 @@ class OsintIn(BaseModel):
     postal_code: Optional[str] = None
     extra_sites: List[str] = []
     sites: List[str] = []
-    max_pages: int = 8
+    max_pages: int = 35
     # REQ economic activity description (e.g. "Fourniture de services informatiques")
     activity: Optional[str] = None
     # Active trade names / DBA from REQ (e.g. ["NETTOYEUR INDUSTRIEL PRO/MAX"])
@@ -1138,46 +1256,80 @@ async def _osint_impl(body: OsintIn):
     # 3. Crawl Target Site Sub-Pages (Render & Clean Markdown)
     if domain:
         base = f"https://{domain}"
-        pages = [base]
-        # Seed top executive leadership & people sub-paths
-        EXECUTIVE_SUBPATHS = [
-            "/people", "/people/", "/our-people", "/ppl",
-            "/team", "/our-team", "/leadership", "/board",
-            "/directors", "/executives", "/equipe", "/notre-equipe",
-            "/direction", "/about/people", "/about/team", "/about/leadership",
-            "/contact", "/contactez-nous", "/nous-joindre", "/about"
-        ]
-        for sub in EXECUTIVE_SUBPATHS:
-            pages.append(urljoin(base, sub))
 
+        # Priority keyword hints for leadership, executive, governance, medical, contact & team pages
+        PRIORITY_PATH_HINTS = (
+            "contact", "joindre", "coordonnees", "coordonnées", "a-propos", "apropos", "propos",
+            "about", "equipe", "équipe", "team", "direction", "notre-entreprise", "staff",
+            "leadership", "management", "people", "ppl", "nos-gens", "gens", "board",
+            "administrateurs", "conseil", "administration", "gouvernance", "directors",
+            "executives", "partners", "associates", "dentiste", "docteur", "chirurgien",
+            "avocat", "notaire", "medecin", "médecin", "gestion", "membres", "dr-"
+        )
+
+        def is_priority_link(text_and_url: str) -> bool:
+            return any(k in text_and_url.lower() for k in PRIORITY_PATH_HINTS)
+
+        # 1. Fetch & analyze the homepage first
         home = await osint_fetch(base)
-        soup = BeautifulSoup(home["html"], "html.parser")
-
-        # Log home page HTML for data extraction provenance
-        home_html = home["html"]
+        home_html = unmask_cloudflare_emails(home.get("html", ""))
         add_raw_source(
             base, home_html,
             ["homepage_venue_links", "contact_page_links", "href_attributes"],
             "site discovery"
         )
 
-        for a in soup.select("a[href]"):
-            t = (a.get_text() or "").lower() + " " + a["href"].lower()
-            if any(k in t for k in (
-                "contact", "about", "propos", "equipe", "team", "direction", "nous", "joindre",
-                "people", "ppl", "leadership", "executives", "directors", "board", "staff", "partners", "nos-gens"
-            )):
-                full_url = urljoin(base, a["href"])
-                if urlparse(full_url).netloc.lower().replace("www.", "") == domain:
-                    pages.append(full_url)
+        # Extract all internal links from the homepage navigation, header, menus, and footer
+        soup_home = BeautifulSoup(home_html, "html.parser")
+        tier1_pages: List[str] = []
+        tier2_pages: List[str] = []
 
+        for a in soup_home.select("a[href]"):
+            raw_href = a.get("href", "").strip()
+            if not raw_href or raw_href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            full_url = urljoin(base, raw_href)
+            parsed = urlparse(full_url)
+            if parsed.netloc.lower().replace("www.", "") == domain:
+                combo = (a.get_text() or "").lower() + " " + raw_href.lower()
+                if is_priority_link(combo):
+                    if full_url not in tier1_pages:
+                        tier1_pages.append(full_url)
+                else:
+                    if full_url not in tier2_pages:
+                        tier2_pages.append(full_url)
+
+        # If homepage provided few leadership/contact links, seed standard speculative paths
+        if len(tier1_pages) < 3:
+            SPECULATIVE_SUBPATHS = [
+                "/a-propos", "/contact", "/contactez-nous", "/nous-joindre",
+                "/conseil-dadministration", "/equipe", "/notre-equipe",
+                "/direction", "/people", "/team", "/leadership", "/board",
+                "/directors", "/executives", "/staff", "/about"
+            ]
+            for sub in SPECULATIVE_SUBPATHS:
+                spec_url = urljoin(base, sub)
+                if spec_url not in tier1_pages:
+                    tier1_pages.append(spec_url)
+
+        crawl_queue: List[str] = [base] + tier1_pages + tier2_pages
         seen = set()
-        for p in pages:
-            if p in seen or len(seen) >= body.max_pages:
+
+        while crawl_queue and len(seen) < body.max_pages:
+            p = crawl_queue.pop(0)
+            if p in seen:
                 continue
             seen.add(p)
-            r = await osint_fetch(p)
-            page_html = unmask_cloudflare_emails(r["html"])
+
+            # Homepage was already fetched above
+            if p == base and home_html:
+                page_html = home_html
+            else:
+                r = await osint_fetch(p)
+                page_html = unmask_cloudflare_emails(r.get("html", ""))
+
+            if not page_html:
+                continue
 
             # Clean page into structured Markdown
             markdown_content = clean_html_to_markdown(page_html)
@@ -1219,7 +1371,7 @@ async def _osint_impl(body: OsintIn):
             # Extract Social Handles
             page_soup = BeautifulSoup(page_html, "html.parser")
             for a in page_soup.select("a[href]"):
-                h = a["href"]
+                h = a.get("href", "")
                 for net in ("linkedin.com", "facebook.com", "instagram.com", "x.com"):
                     if net in h and net not in socials:
                         socials[net] = h
@@ -1232,13 +1384,27 @@ async def _osint_impl(body: OsintIn):
                 if m:
                     address = m.group(0)
 
+            # Recursive link discovery: If this crawled page contains new priority links (e.g. /staff/dr-...), queue them
+            for a in page_soup.select("a[href]"):
+                sub_href = a.get("href", "").strip()
+                if not sub_href or sub_href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                    continue
+                sub_full = urljoin(p, sub_href)
+                sub_parsed = urlparse(sub_full)
+                if sub_parsed.netloc.lower().replace("www.", "") == domain:
+                    if sub_full not in seen and sub_full not in crawl_queue:
+                        combo = (a.get_text() or "").lower() + " " + sub_href.lower()
+                        if is_priority_link(combo):
+                            # Insert newly discovered priority sub-links at the front of the queue
+                            crawl_queue.insert(0, sub_full)
+
             # Log the raw HTML/JS source
             add_raw_source(
                 p, page_html,
                 extraction_summary if extraction_summary else ["general_html_parse"],
                 "site crawl"
             )
-            log.append(f"Crawled {p} (Found {len(emails)} emails so far)")
+            log.append(f"Crawled {p} (Found {len(people)} people, {len(emails)} emails so far)")
 
     # 4. Executive Pattern Candidate Permutations
     # Generate unique pattern-based emails for executives who don't have personal emails
