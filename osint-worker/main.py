@@ -113,10 +113,17 @@ BAD_EMAIL_HINTS = (
 BAD_HOSTS = (
     "duckduckgo.com", "google.", "bing.com", "yahoo.", "mojeek.com", "search.brave.com",
     "microsoft.", "msn.", "live.", "windows.", "wikipedia.org", "wikimedia.org", "wikidata.org",
-    "wiktionary.org", "canada.ca", "gc.ca", "gouv.qc.ca", "quebec.ca",
-    "tradingview.com", "marketwatch.com", "investing.com", "thefreedictionary.com",
+    "wiktionary.org", "britannica.com", "ancestry.", "zonebourse.com", "thefreedictionary.com",
+    "dictionary.com", "merriam-webster.com", "geni.com", "familysearch.org",
+    "canada.ca", "gc.ca", "gouv.qc.ca", "quebec.ca",
+    "tradingview.com", "marketwatch.com", "investing.com",
     "calculator.name", "calculateme.com", "coolconversion.com", "apkmirror.com",
     "zhihu.com", "uhrforum.de"
+)
+
+STATIC_ASSET_EXTENSIONS = (
+    ".css", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+    ".woff", ".woff2", ".ttf", ".eot", ".webmanifest", ".map", ".js"
 )
 
 # Directory / review portals & third-party ordering platforms — never accept these as a company's official domain.
@@ -290,6 +297,7 @@ async def launch_browser(app: FastAPI):
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
+            "--disable-http2",
         ],
     )
 
@@ -435,7 +443,14 @@ def is_search_engine_url(url: str) -> bool:
 
 async def _render_impl(body: RenderIn):
     parsed = urlparse(body.url)
-    host = (parsed.netloc or "").split(":")[0]
+    host = (parsed.netloc or "").split(":")[0].lower().replace("www.", "")
+    if host and not is_search_engine_url(body.url) and any(b in host for b in BAD_HOSTS):
+        return {"ok": False, "status": 403, "url": body.url, "error": f"Bad host blocked: {host}", "html": "", "text": ""}
+
+    parsed_path = parsed.path.lower()
+    if any(parsed_path.endswith(ext) for ext in STATIC_ASSET_EXTENSIONS):
+        return {"ok": False, "status": 200, "url": body.url, "error": "Static asset ignored", "html": "", "text": ""}
+
     if host and not is_search_engine_url(body.url) and not dns_resolves(host):
         return {"ok": False, "status": 0, "url": body.url, "error": "net::ERR_NAME_NOT_RESOLVED", "html": "", "text": ""}
 
@@ -467,6 +482,7 @@ async def _render_impl(body: RenderIn):
                 locale="en-CA",
                 timezone_id="America/Toronto",
                 viewport={"width": 1366, "height": 900},
+                ignore_https_errors=True,
                 extra_http_headers={
                     "Accept-Language": "en-CA,en;q=0.9,fr-CA;q=0.8,fr;q=0.7",
                     "Upgrade-Insecure-Requests": "1",
@@ -481,10 +497,15 @@ async def _render_impl(body: RenderIn):
                 await _STEALTH_V1(page)
 
             async def _block_media(route):
-                if route.request.resource_type in ("image", "media", "font"):
+                req = route.request
+                if req.resource_type in ("image", "media", "font"):
                     await route.abort()
-                else:
-                    await route.continue_()
+                    return
+                req_path = urlparse(req.url).path.lower()
+                if any(req_path.endswith(ext) for ext in (".svg", ".ico", ".woff", ".woff2", ".ttf", ".webmanifest")):
+                    await route.abort()
+                    return
+                await route.continue_()
 
             await page.route("**/*", _block_media)
 
@@ -559,16 +580,22 @@ async def _search_google_maps_impl(query: str) -> Dict[str, Any]:
                 locale="fr-CA",
                 timezone_id="America/Toronto",
                 viewport={"width": 1280, "height": 800},
+                ignore_https_errors=True,
                 extra_http_headers={"Accept-Language": "fr-CA,fr;q=0.9,en-CA;q=0.8"},
             )
             page = await context.new_page()
             page.set_default_timeout(14000)
 
             async def _block_media(route):
-                if route.request.resource_type in ("image", "media", "font"):
+                req = route.request
+                if req.resource_type in ("image", "media", "font"):
                     await route.abort()
-                else:
-                    await route.continue_()
+                    return
+                req_path = urlparse(req.url).path.lower()
+                if any(req_path.endswith(ext) for ext in (".svg", ".ico", ".woff", ".woff2", ".ttf", ".webmanifest")):
+                    await route.abort()
+                    return
+                await route.continue_()
 
             await page.route("**/*", _block_media)
             url = f"https://www.google.com/maps/search/{quote_plus(query)}/"
@@ -1892,7 +1919,7 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
         for rq in reg_queries:
             r_urls = await search(
                 rq,
-                lambda h: any(k in h for k in ("can1business.com", "opengovca.com", "b2bhint.com", "quebecentreprises.com", "companies-canada.ca", "registre")),
+                lambda h: any(k in h for k in ("can1business.com", "b2bhint.com", "quebecentreprises.com", "companies-canada.ca", "registre")) and "opengovca.com" not in h,
                 allow_browser=True,
             )
             for ru in r_urls[:3]:
@@ -2010,6 +2037,8 @@ async def _osint_impl(body: OsintIn, state_box: Optional[Dict[str, Any]] = None)
                 continue
             full_url = urljoin(base, raw_href)
             parsed = urlparse(full_url)
+            if any(parsed.path.lower().endswith(ext) for ext in STATIC_ASSET_EXTENSIONS):
+                continue
             if parsed.netloc.lower().replace("www.", "") == domain:
                 combo = (a.get_text() or "").lower() + " " + raw_href.lower()
                 if is_priority_link(combo):

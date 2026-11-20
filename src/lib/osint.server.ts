@@ -423,7 +423,11 @@ export function unmaskCloudflareEmails(html: string): string {
   return res;
 }
 
+const STATIC_ASSET_EXT =
+  /\.(?:css|svg|png|jpe?g|gif|webp|ico|woff2?|ttf|eot|webmanifest|map|js)(?:\?.*)?$/i;
+
 async function workerFetch(url: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<string | null> {
+  if (STATIC_ASSET_EXT.test(url)) return null;
   const base = runtimeWorker.url ?? process.env["OSINT_WORKER_URL"];
   const secret = runtimeWorker.secret ?? process.env["OSINT_WORKER_SECRET"];
   if (!base) return null;
@@ -1709,6 +1713,7 @@ export async function gatherEvidence(
         const generalInternal: string[] = [];
         for (const m of home.matchAll(/<a\s+[^>]*href=["']([^"'#\s>]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
           const href = m[1]!.replace(/&amp;/g, "&");
+          if (STATIC_ASSET_EXT.test(href)) continue;
           const anchorText = m[2]!.replace(/<[^>]+>/g, " ").trim();
           try {
             const abs = new URL(href, candidate).toString();
@@ -1725,6 +1730,7 @@ export async function gatherEvidence(
         }
         for (const m of home.matchAll(/href\s*=\s*["']([^"'#\s>]+)["']/gi)) {
           const href = m[1]!.replace(/&amp;/g, "&");
+          if (STATIC_ASSET_EXT.test(href)) continue;
           try {
             const abs = new URL(href, candidate).toString();
             if (hostOf(abs) === domain && !priorityInternal.includes(abs) && !generalInternal.includes(abs)) {
@@ -1776,6 +1782,7 @@ export async function gatherEvidence(
         const pageUrl = urls[i] ?? candidate ?? `https://${domain}`;
         for (const m of page.matchAll(/<a\s+[^>]*href=["']([^"'#\s>]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
           const href = m[1]!.replace(/&amp;/g, "&");
+          if (STATIC_ASSET_EXT.test(href)) continue;
           const anchorText = m[2]!.replace(/<[^>]+>/g, " ").trim();
           if (!CONTACT_HINT.test(href) && !CONTACT_HINT.test(anchorText)) continue;
           try {
@@ -1789,6 +1796,7 @@ export async function gatherEvidence(
         }
         for (const m of page.matchAll(/href\s*=\s*["']([^"'#\s>]+)["']/gi)) {
           const href = m[1]!.replace(/&amp;/g, "&");
+          if (STATIC_ASSET_EXT.test(href)) continue;
           if (!CONTACT_HINT.test(href)) continue;
           try {
             const abs = new URL(href, pageUrl).toString();
